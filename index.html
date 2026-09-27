@@ -31,14 +31,14 @@
 </head>
 <body>
 <div id="wrap">
-<header><strong>吸石油玩法 · 3D MVP（写实黏稠油层版）</strong><span>WASD / 方向键移动｜触屏拖动移动｜H：调试｜软管上限：900</span></header>
+<header><strong>吸石油玩法 · 3D MVP（圆滑侵蚀 + Q弹版）</strong><span>WASD / 方向键移动｜触屏拖动移动｜H：调试｜软管上限：900</span></header>
 <div id="stageWrap">
   <div id="stage"></div>
   <div id="loading">正在加载 3D 引擎…</div>
   <div id="hud">
     <div class="title"><div id="status">靠近吸油机拿取吸头</div><div class="badge" id="tensionBadge">软管：未连接</div></div>
     <div class="hint" id="hint">进入吸油机黄色交互圈并停留，自动拿管。</div>
-    <div class="sub">3D 原型：高速解压版——吸油速度再次提升；清理后的地面会明显经历“深色湿润→高光扫过→逐渐干燥恢复”的过程。</div>
+    <div class="sub">3D 原型：圆滑侵蚀版——油面连续变薄、轮廓快速内退；厚油保留强 Q 弹，薄边缘稳定清空。</div>
     <div id="pickupBar"><div class="fill" id="pickupFill"></div></div>
   </div>
   <div id="debug" class="hidden"></div>
@@ -72,7 +72,34 @@ const CFG = {
   pullbackDistance: 22, pullbackCooldown: .48,
   suctionRange: 135, suctionHalfAngle: Math.PI/4.5, nearSuctionRadius: 52, preSuction: .1,
   oilCollisionRadius: 25, oilCollisionForwardOffset: 32, oilCollisionSamples: 18,
-  suctionCellsPerSec: 18.0, cleanupThreshold: .05, finishDuration: .72,
+  suctionCellsPerSec: 18.0, cleanupThreshold: .045, finishDuration: .72,
+  // Height-field suction: permanent oil amount and elastic deformation are separate.
+  // 主体厚度真实下降：中心区域 0.5~0.8 秒内能看出明显变薄，不再只看到轮廓变化。
+  heightSuctionSpeed: 82,
+  heightSuctionPulseMul: 2.18,
+  heightSuctionRadius: 126,
+  heightSuctionNearRadius: 54,
+  heightClearThreshold: .55,
+  heightCollisionThreshold: 4.0,
+  // 圆滑侵蚀：只允许降低。多次弱平滑 + 坡度限制，消掉规则网格的“齿轮边”。
+  heightErosionSmoothRadius: 172,
+  heightErosionSmoothPasses: 4,
+  heightErosionSmoothAlpha: .16,
+  heightMaxNeighborSlope: 4.6,
+  heightSlopeClampAlpha: .62,
+  heightRenderFeather: 12.0,
+  heightThinFastStart: 13,
+  heightThinFastMul: 2.15,
+  heightThinSnap: 1.15,
+  // Q 弹只作用在厚油；边缘变薄后快速收敛，内部仍保留强 Duang。
+  heightSpringFadeStart: 9,
+  heightSpringFull: 25,
+  heightSpringMaxOffsetRatio: .44,
+  heightSpringMaxOffsetAbs: 14.5,
+  springSuctionImpulse: 440,
+  springPulseImpulseMul: 2.55,
+  springNeighborImpulse: .68,
+  oilParticleVolumeStep: 820,
   suctionPatchRadius: 27, residualLinkRadius: 38, residualIslandMaxCells: 3,
   retractSpeed: 430, playerRadius: 18, hosePad: 12,
   // 镜头震动：持续机器运转使用低幅连续噪声；正式吸油再抬高强度。单位为世界坐标偏移量。
@@ -108,9 +135,9 @@ const CFG = {
   oilAdvectionSpeed: 0,
   oilAdvectionPulseMul: 0,
   oilAdvectionStopDistance: 18,
-  oilMassPullRadius: 158,
-  oilMassPullDistance: 18,
-  oilMassPulseDistance: 10,
+  oilMassPullRadius: 138,
+  oilMassPullDistance: 5.5,
+  oilMassPulseDistance: 4.0,
   suctionDentRadius: 60,
   suctionDentDepth: 4.2,
   suctionDentPulseDepth: 7.4,
@@ -283,7 +310,6 @@ function updateNozzleVortexVisual(){
   }
 }
 
-// Rope is built from reusable cylinder segments.
 const ropeGroup=new THREE.Group(); scene.add(ropeGroup);
 const ropeBaseColor=new THREE.Color(0x67b8ff);
 const ropeOilColor=new THREE.Color(0x20262f);
@@ -303,6 +329,7 @@ const anchorGroup=new THREE.Group();scene.add(anchorGroup);
 
 let oilCells=[], oilMesh=null, initialOilCount=0;
 let oilSurfaceDirty=true, oilSurfaceLastUpdate=-999;
+let oilRestHeight=null, oilInitialRestHeight=null, oilInitialVolume=0, oilParticleVolumeBudget=0;
 let oilSpringY=null, oilSpringV=null;
 const OIL_SURFACE={
   minX:10,maxX:610,minZ:-340,maxZ:330,
@@ -313,11 +340,11 @@ const OIL_SURFACE={
   blurPasses:4,
   edgeSmoothPasses:2,
   visualLerpSpeed:5.0,
-  springStiffness:78,
-  springDamping:6.6,
-  springNeighborCoupling:12.0,
-  springMaxSpeed:190,
-  surfaceBaseY:-7.5,
+  springStiffness:92,
+  springDamping:2.65,
+  springNeighborCoupling:31.0,
+  springMaxSpeed:330,
+  surfaceBaseY:-2.2,
   reboundDuration:.52,
   reboundRadius:64,
   tractionRadius:72,
@@ -336,8 +363,6 @@ const oilMat=new THREE.MeshPhysicalMaterial({
   emissiveIntensity:.12,
   side:THREE.DoubleSide
 });
-
-// V0.1 V2：显式“油舌”连接主体油面与吸头；断开的油坨飞到吸头后才真正删除。
 const oilTongueGroup=new THREE.Group();scene.add(oilTongueGroup);
 const oilTongueGeo=new THREE.SphereGeometry(1,14,10);
 const oilTongueNodes=[];
@@ -387,7 +412,6 @@ function buildOil(){
     const deterministic=((Math.floor((x+700)/step)*17+Math.floor((z+500)/step)*31)%23)!==0;
     if(inside&&deterministic){
       const noise=((x*7+z*11)%19+19)%19/19;
-      // 逻辑仍然是独立 Cell；视觉由这些 Cell 共同生成连续油面。
       const height=10+noise*15;
       const blobRadius=15+noise*6;
       const squash=.64+noise*.16;
@@ -398,9 +422,33 @@ function buildOil(){
   initialOilCount=oilCells.length;
   oilMesh=new THREE.Mesh(createOilSurfaceGeometry(),oilMat);
   const vCount=oilMesh.geometry.attributes.position.count;
+  oilRestHeight=new Float32Array(vCount);
+  oilInitialRestHeight=new Float32Array(vCount);
   oilSpringY=new Float32Array(vCount);
   oilSpringV=new Float32Array(vCount);
-  oilSpringY.fill(OIL_SURFACE.surfaceBaseY);
+  const cols=OIL_SURFACE.cols, rows=OIL_SURFACE.rows;
+  let vi=0, volume=0;
+  for(let rz=0;rz<=rows;rz++){
+    const z=lerp(OIL_SURFACE.minZ,OIL_SURFACE.maxZ,rz/rows);
+    for(let cx=0;cx<=cols;cx++){
+      const x=lerp(OIL_SURFACE.minX,OIL_SURFACE.maxX,cx/cols);
+      const density=oilDensityAt(x,z);
+      const edge=smoothstep01((density-OIL_SURFACE.threshold*.42)/.50);
+      let h=0;
+      if(edge>0){
+        const dome=Math.pow(edge,.58);
+        const thick=18 + Math.tanh(density*.82)*46;
+        h=dome*thick;
+      }
+      oilRestHeight[vi]=h;
+      oilInitialRestHeight[vi]=h;
+      volume+=h;
+      vi++;
+    }
+  }
+  oilInitialVolume=Math.max(1,volume);
+  oilParticleVolumeBudget=0;
+  oilSpringY.fill(0);
   oilSpringV.fill(0);
   oilMesh.receiveShadow=true;
   oilMesh.castShadow=false;
@@ -430,1072 +478,215 @@ function oilDensityAt(x,z){
     if(d2>=r*r)continue;
     const d=Math.sqrt(d2);
     const q=1-d/r;
-    // 类 metaball 密度核：多个 Cell 的场相加后自然融合。
     density += (q*q*(.82+.75*q)) * strength;
   }
   return density;
 }
-function oilReboundAt(x,z,time){
-  let h=0;
-  for(const c of oilCells){
-    if(c.active || c.removedAt<0) continue;
-    const age=time-c.removedAt;
-    if(age<0 || age>OIL_SURFACE.reboundDuration) continue;
-    const dx=x-c.x,dz=z-c.z;
-    const d=Math.hypot(dx,dz);
-    const r=OIL_SURFACE.reboundRadius;
-    if(d>=r) continue;
-    // 形成一个环状回弹：洞边鼓起再缓慢回落。
-    const ringCenter=r*.52;
-    const ringWidth=r*.32;
-    const ring=Math.max(0,1-Math.abs(d-ringCenter)/ringWidth);
-    const t=age/OIL_SURFACE.reboundDuration;
-    const spring=Math.sin(t*Math.PI) * (1-t);
-    h += ring * spring * 4.8;
+function oilGridIndex(cx,rz){return rz*(OIL_SURFACE.cols+1)+cx}
+function oilGridWorld(cx,rz){return {x:lerp(OIL_SURFACE.minX,OIL_SURFACE.maxX,cx/OIL_SURFACE.cols),z:lerp(OIL_SURFACE.minZ,OIL_SURFACE.maxZ,rz/OIL_SURFACE.rows)}}
+function sampleOilRestHeight(x,z){
+  if(!oilRestHeight)return 0;
+  const u=(x-OIL_SURFACE.minX)/(OIL_SURFACE.maxX-OIL_SURFACE.minX);
+  const v=(z-OIL_SURFACE.minZ)/(OIL_SURFACE.maxZ-OIL_SURFACE.minZ);
+  if(u<0||u>1||v<0||v>1)return 0;
+  const fx=u*OIL_SURFACE.cols, fz=v*OIL_SURFACE.rows;
+  const x0=Math.max(0,Math.min(OIL_SURFACE.cols,Math.floor(fx))), x1=Math.min(OIL_SURFACE.cols,x0+1);
+  const z0=Math.max(0,Math.min(OIL_SURFACE.rows,Math.floor(fz))), z1=Math.min(OIL_SURFACE.rows,z0+1);
+  const tx=fx-x0,tz=fz-z0;
+  const a=oilRestHeight[oilGridIndex(x0,z0)], b=oilRestHeight[oilGridIndex(x1,z0)];
+  const c=oilRestHeight[oilGridIndex(x0,z1)], d=oilRestHeight[oilGridIndex(x1,z1)];
+  return lerp(lerp(a,b,tx),lerp(c,d,tx),tz);
+}
+function currentOilVolume(){if(!oilRestHeight)return 0;let sum=0;for(let i=0;i<oilRestHeight.length;i++)sum+=oilRestHeight[i];return sum}
+function oilRemainingRatio(){return oilInitialVolume>0?currentOilVolume()/oilInitialVolume:0}
+function pointInSuctionZoneXZ(x,z){
+  const n=nozzlePos(),vx=x-n.x,vz=z-n.z,d=Math.hypot(vx,vz);
+  if(d<=CFG.heightSuctionNearRadius)return true;
+  if(d>CFG.suctionRange||d<1)return false;
+  const nx=vx/d,nz=vz/d;
+  return Math.acos(Math.max(-1,Math.min(1,nx*facing.x+nz*facing.z)))<=CFG.suctionHalfAngle;
+}
+function findHeightFieldTarget(){
+  if(!oilRestHeight)return null;
+  const n=nozzlePos();
+  let best=null,bd=1e9;
+  for(let rz=0;rz<=OIL_SURFACE.rows;rz+=2){
+    for(let cx=0;cx<=OIL_SURFACE.cols;cx+=2){
+      const i=oilGridIndex(cx,rz),h=oilRestHeight[i];
+      if(h<=CFG.heightClearThreshold)continue;
+      const p=oilGridWorld(cx,rz);
+      if(!pointInSuctionZoneXZ(p.x,p.z))continue;
+      const d=Math.hypot(p.x-n.x,p.z-n.z);
+      if(d<bd){bd=d;best={x:p.x,z:p.z,index:i,active:true}}
+    }
   }
-  return h;
+  return best;
 }
-function oilTractionAt(x,z,time){
-  if(!(state==='PRESUCTION' || state==='SUCTION' || state==='FINISH')) return 0;
-  const n=nozzlePos();
-  const tx=targetCell?targetCell.x:n.x+facing.x*44;
-  const tz=targetCell?targetCell.z:n.z+facing.z*44;
-  const cx=lerp(tx,n.x,.35), cz=lerp(tz,n.z,.35);
-  const dx=x-cx,dz=z-cz;
-  const d=Math.hypot(dx,dz);
-  if(d>=OIL_SURFACE.tractionRadius) return 0;
-  const t=1-d/OIL_SURFACE.tractionRadius;
-  const pulse=.84 + .16*Math.sin(time*10.5 + d*.08);
-  let strength = (state==='PRESUCTION') ? 2.6 : (state==='SUCTION' ? 4.3 : 3.4);
-  if(state==='SUCTION') strength*=1+suctionPulseStrength*.72;
-  return Math.pow(t,1.65) * strength * pulse;
-}
-function oilStringTractionAt(x,z,time){
-  if(!(state==='PRESUCTION' || state==='SUCTION' || state==='FINISH')) return {x:0,z:0,lift:0};
-  const n=nozzlePos();
-  const tx=targetCell?targetCell.x:n.x+facing.x*34;
-  const tz=targetCell?targetCell.z:n.z+facing.z*34;
-  const vx=n.x-tx, vz=n.z-tz;
-  const len=Math.hypot(vx,vz);
-  if(len<1) return {x:0,z:0,lift:0};
-  const dirx=vx/len, dirz=vz/len;
-  const px=x-tx, pz=z-tz;
-  const along=px*dirx + pz*dirz;
-  const maxLen=len+OIL_SURFACE.stringLengthPad;
-  if(along<-10 || along>maxLen) return {x:0,z:0,lift:0};
-  const lateral=Math.abs(px*(-dirz) + pz*(dirx));
-  const normalized=Math.max(0,Math.min(1,along/Math.max(1,maxLen)));
-
-  // 正确的“拉丝”方向：主要把油面顶点沿 XZ 平面朝吸头方向拽，Y 轴只做少量抬升。
-  const widthBase=OIL_SURFACE.stringWidth * (1.12 - normalized*.62);
-  const widthPulse=1 + 0.06*Math.sin(time*9.2 - along*0.04);
-  const width=Math.max(4.2, widthBase*widthPulse);
-  if(lateral>width) return {x:0,z:0,lift:0};
-
-  const core=Math.max(0,1-lateral/width);
-  const strand=Math.pow(core,2.7);
-  const neck=Math.exp(-Math.pow((normalized-.70)/.18,2));
-  const root=Math.exp(-Math.pow((normalized-.24)/.27,2));
-  const tip=Math.exp(-Math.pow((normalized-.92)/.11,2));
-  const suctionPulse=.88 + .12*Math.sin(time*15.0 - along*0.11) + .05*Math.sin(time*22.0 - along*0.17);
-  const stateMul = state==='PRESUCTION' ? .72 : state==='SUCTION' ? 1.18 : 1.0;
-  const gulpPullMul=state==='SUCTION' ? 1+suctionPulseStrength*1.05 : 1;
-  const gulpLiftMul=state==='SUCTION' ? 1+suctionPulseStrength*.42 : 1;
-
-  // 水平牵引远大于垂直抬升，视觉上像被吸头“拽过去”，而不是往上长。
-  const horizontalProfile=(root*.7 + neck*2.2 + tip*1.4) * (.52+.32*normalized);
-  const liftProfile=(root*.35 + neck*.8 + tip*.45) * (.50+.20*normalized);
-  const pull= strand * horizontalProfile * suctionPulse * stateMul * gulpPullMul;
-  const lift= strand * liftProfile * suctionPulse * stateMul * gulpLiftMul;
-  return {x:dirx*pull,z:dirz*pull,lift};
-}
-function oilBackflowAt(x,z,time){
-  let h=0;
-  for(const c of oilCells){
-    if(c.active || c.removedAt<0) continue;
-    const age=time-c.removedAt;
-    const delay=OIL_SURFACE.reboundDuration*.38;
-    if(age<delay || age>delay+OIL_SURFACE.backflowDuration) continue;
-    const local=(age-delay)/OIL_SURFACE.backflowDuration;
-    const dx=x-c.x,dz=z-c.z;
-    const d=Math.hypot(dx,dz);
-    const r=OIL_SURFACE.backflowRadius;
-    if(d>=r) continue;
-    const inward=Math.max(0,1-d/r);
-    const ring=Math.max(0,1-Math.abs(d-r*.40)/(r*.34));
-    const settle=Math.sin(Math.min(1,local)*Math.PI*.92)*(1-local*.22);
-    const sticky=Math.max(ring*.95, Math.pow(inward,1.7)*.42);
-    h += sticky * settle * 4.6;
-  }
-  return h;
-}
-
-function oilPeelAt(x,z,time){
-  if(!(state==='PRESUCTION' || state==='SUCTION' || state==='FINISH') || !targetCell) return {x:0,z:0,lift:0};
-  const n=nozzlePos();
-  const dir=norm({x:n.x-targetCell.x,z:n.z-targetCell.z});
-  const side={x:-dir.z,z:dir.x};
-  const px=x-targetCell.x, pz=z-targetCell.z;
-  const along=px*dir.x + pz*dir.z;
-  const lateral=Math.abs(px*side.x + pz*side.z);
-  const radial=Math.hypot(px,pz);
-  const ring=Math.max(0,1-Math.abs(radial-CFG.peelRadius)/13.5);
-  const front=smoothstep01((along+6)/24) * (1-smoothstep01((along-30)/16));
-  const latMask=Math.max(0,1-lateral/17);
-  const pulse=.82 + .18*Math.sin(time*12.6 + radial*.05);
-  const stateMul=state==='PRESUCTION'?.76:state==='SUCTION'?1.16:.98;
-  const a=ring*front*latMask*pulse*stateMul;
-  // 强化朝吸头方向的 stretch，同时保留少量 lift，让边缘像被揪起的厚史莱姆。
-  return {x:dir.x*a*2.8,z:dir.z*a*2.8,lift:a*CFG.peelLift};
-}
-function oilVolumeBulgeAt(x,z,time){
-  if(!(state==='PRESUCTION' || state==='SUCTION' || state==='FINISH') || !targetCell) return 0;
-  const n=nozzlePos();
-  const dir=norm({x:n.x-targetCell.x,z:n.z-targetCell.z});
-  // 受力点后方一点作为“挤压中心”，中心被吸下去时，旁边一圈更明显地鼓起来，形成厚史莱姆被挤开的感觉。
-  const cx=targetCell.x - dir.x*10;
-  const cz=targetCell.z - dir.z*10;
-  const d=Math.hypot(x-cx,z-cz);
-  const inner=CFG.volumeBulgeInner, outer=CFG.volumeBulgeOuter;
-  if(d<inner || d>outer) return 0;
-  const mid=inner + (outer-inner)*.42;
-  const half=(outer-inner)*.58;
-  const ring=Math.max(0,1-Math.abs(d-mid)/half);
-  const shoulder=Math.max(0,1-Math.abs(d-(mid+10))/(half*1.15));
-  const pulse=.84 + .16*Math.sin(time*10.2 + d*.07);
-  const stateMul=state==='PRESUCTION'?.76:state==='SUCTION'?1.22:.98;
-  return (Math.pow(ring,1.08)*.82 + Math.pow(shoulder,1.45)*.46) * pulse * CFG.volumeBulgeAmp * stateMul;
-}
-function oilMassPullAt(x,z){
-  if(!(state==='PRESUCTION'||state==='SUCTION') || !targetCell)return {x:0,z:0,lift:0};
-  const n=nozzlePos();
-  const tx=targetCell.x,tz=targetCell.z;
-  const dx=x-tx,dz=z-tz,d=Math.hypot(dx,dz);
-  if(d>=CFG.oilMassPullRadius)return {x:0,z:0,lift:0};
-  const vx=n.x-tx,vz=n.z-tz,len=Math.hypot(vx,vz)||1;
-  const dirx=vx/len,dirz=vz/len;
-  const influence=Math.pow(1-d/CFG.oilMassPullRadius,1.35);
-  const stateMul=state==='PRESUCTION'?.42:1;
-  const pull=(CFG.oilMassPullDistance+CFG.oilMassPulseDistance*suctionPulseStrength)*influence*stateMul;
-  // 这里只做“向前拉”，不再额外把油顶高；高度主要交给凹陷/拉丝表现。
-  const lift=.35*Math.pow(influence,1.7)*stateMul;
-  return {x:dirx*pull,z:dirz*pull,lift};
-}
-function oilSuctionDentAt(x,z){
-  if(state!=='SUCTION' || !targetCell) return 0;
-  const n=nozzlePos();
-  const cx=lerp(targetCell.x,n.x,.22), cz=lerp(targetCell.z,n.z,.22);
-  const d=Math.hypot(x-cx,z-cz);
-  if(d>=CFG.suctionDentRadius) return 0;
-  const q=1-d/CFG.suctionDentRadius;
-  const depth=CFG.suctionDentDepth + CFG.suctionDentPulseDepth*suctionPulseStrength;
-  return -Math.pow(q,1.65)*depth;
-}
-function oilPressureWaveAt(x,z,time){
-  if(!(state==='PRESUCTION' || state==='SUCTION' || state==='FINISH')) return 0;
-  const n=nozzlePos();
-  const cx=targetCell?targetCell.x:lerp(player.x,n.x,.6);
-  const cz=targetCell?targetCell.z:lerp(player.z,n.z,.6);
-  const d=Math.hypot(x-cx,z-cz);
-  const maxR=state==='FINISH'?126:108;
-  if(d>maxR) return 0;
-  // 用距离相位延迟来模拟“中心先动，外圈晚一点跟着 duang”的传播感。
-  const phase=time*10.6 - d*0.18;
-  const wave=Math.max(0,Math.sin(phase));
-  const envelope=(1-d/maxR)*(0.72 + 0.28*Math.sin(time*5.4));
-  const stateMul=state==='PRESUCTION'?.56:state==='SUCTION'?1.0:.80;
-  return wave*envelope*CFG.pressureWaveAmp*stateMul;
-}
+function oilReboundAt(x,z,time){return 0}
+function oilTractionAt(x,z,time){return 0}
+function oilStringTractionAt(x,z,time){return {x:0,z:0,lift:0}}
+function oilBackflowAt(x,z,time){return 0}
+function oilPeelAt(x,z,time){return {x:0,z:0,lift:0}}
+function oilVolumeBulgeAt(x,z,time){return 0}
+function oilMassPullAt(x,z){return {x:0,z:0,lift:0}}
+function oilSuctionDentAt(x,z){return 0}
+function oilPressureWaveAt(x,z,time){return 0}
 function updateOilSurface(time,force=false){
-  if(!oilMesh)return;
+  if(!oilMesh||!oilRestHeight)return;
   if(!force && !oilSurfaceDirty && time-oilSurfaceLastUpdate < 1/OIL_SURFACE.updateHz)return;
-
   const prevUpdate=oilSurfaceLastUpdate;
-  const dt = force || prevUpdate < -100 ? 1/OIL_SURFACE.updateHz : Math.max(.012,Math.min(.055,time-prevUpdate));
+  const dt=force||prevUpdate<-100?1/OIL_SURFACE.updateHz:Math.max(.012,Math.min(.055,time-prevUpdate));
   oilSurfaceLastUpdate=time;
-
   const pos=oilMesh.geometry.attributes.position;
   const arr=pos.array;
-  const cols=OIL_SURFACE.cols, rows=OIL_SURFACE.rows;
-  const gridW=cols+1, gridH=rows+1;
-  const count=gridW*gridH;
-
-  if(!oilSpringY || oilSpringY.length!==count){
-    oilSpringY=new Float32Array(count);
-    oilSpringV=new Float32Array(count);
-    oilSpringY.fill(OIL_SURFACE.surfaceBaseY);
-  }
-
-  let dens=new Float32Array(count);
-  let idx=0;
-  for(let rz=0;rz<=rows;rz++){
-    const vz=rz/rows;
-    const z=lerp(OIL_SURFACE.minZ,OIL_SURFACE.maxZ,vz);
-    for(let cx=0;cx<=cols;cx++){
-      const ux=cx/cols;
-      const x=lerp(OIL_SURFACE.minX,OIL_SURFACE.maxX,ux);
-      dens[idx++]=oilDensityAt(x,z);
-    }
-  }
-
-  // 先平滑密度场，避免 Oil Cell / 固定网格在边缘形成锯齿状轮廓。
-  for(let pass=0; pass<OIL_SURFACE.blurPasses; pass++){
-    const src=dens;
-    const out=new Float32Array(src.length);
-    for(let rz=0; rz<gridH; rz++){
-      for(let cx=0; cx<gridW; cx++){
-        let sum=0, wsum=0;
-        for(let dz=-1; dz<=1; dz++){
-          const zz=rz+dz; if(zz<0||zz>=gridH) continue;
-          for(let dx=-1; dx<=1; dx++){
-            const xx=cx+dx; if(xx<0||xx>=gridW) continue;
-            const w=(dx===0&&dz===0)?5:(dx===0||dz===0)?2:1;
-            sum += src[zz*gridW+xx]*w;
-            wsum += w;
-          }
-        }
-        out[rz*gridW+cx]=sum/wsum;
-      }
-    }
-    dens=out;
-  }
-
-  let targetY=new Float32Array(count);
-  let targetX=new Float32Array(count);
-  let targetZ=new Float32Array(count);
-  let vi=0;
-  for(let rz=0;rz<=rows;rz++){
-    const vz=rz/rows;
-    const baseZ=lerp(OIL_SURFACE.minZ,OIL_SURFACE.maxZ,vz);
-    for(let cx=0;cx<=cols;cx++){
-      const ux=cx/cols;
-      const baseX=lerp(OIL_SURFACE.minX,OIL_SURFACE.maxX,ux);
-      const density=dens[rz*gridW+cx];
-
-      // 更宽的软边：视觉轮廓提前抬升，避免锯齿状穿出地板。
-      const edge=smoothstep01((density-OIL_SURFACE.threshold*.42)/.50);
-      let h=0;
-      if(edge>0){
-        const dome=Math.pow(edge,.58);
-        const thick=18 + Math.tanh(density*.82)*46;
-        const breathe=(Math.sin(time*.95+baseX*.015+baseZ*.010)+Math.sin(time*.63+baseX*.008-baseZ*.013))*.34;
-        h=dome*(thick+breathe);
-      }
-
-      const rebound=oilReboundAt(baseX,baseZ,time);
-      const traction=oilTractionAt(baseX,baseZ,time);
-      const stringPull=oilStringTractionAt(baseX,baseZ,time);
-      const peel=oilPeelAt(baseX,baseZ,time);
-      const volumeBulge=oilVolumeBulgeAt(baseX,baseZ,time);
-      const pressureWave=oilPressureWaveAt(baseX,baseZ,time);
-      const backflow=oilBackflowAt(baseX,baseZ,time);
-      const massPull=oilMassPullAt(baseX,baseZ);
-      const suctionDent=oilSuctionDentAt(baseX,baseZ);
-      h += rebound + traction + stringPull.lift + peel.lift + volumeBulge + pressureWave + backflow + suctionDent + massPull.lift;
-
-      const edgePull=Math.pow(edge,.62);
-      targetX[vi]=baseX + (stringPull.x + peel.x + massPull.x)*edgePull;
-      targetZ[vi]=baseZ + (stringPull.z + peel.z + massPull.z)*edgePull;
-      targetY[vi]=OIL_SURFACE.surfaceBaseY + edge*((-OIL_SURFACE.surfaceBaseY)+h);
-      vi++;
-    }
-  }
-
-  // 再平滑目标高度，让边缘形成连续圆坡，而不是三角形“牙齿”。
-  for(let pass=0;pass<OIL_SURFACE.edgeSmoothPasses;pass++){
-    const src=targetY;
-    const out=new Float32Array(src.length);
-    for(let rz=0;rz<gridH;rz++){
-      for(let cx=0;cx<gridW;cx++){
-        let sum=0,wsum=0;
-        for(let dz=-1;dz<=1;dz++){
-          const zz=rz+dz;if(zz<0||zz>=gridH)continue;
-          for(let dx=-1;dx<=1;dx++){
-            const xx=cx+dx;if(xx<0||xx>=gridW)continue;
-            const w=(dx===0&&dz===0)?7:(dx===0||dz===0)?2:1;
-            sum+=src[zz*gridW+xx]*w;wsum+=w;
-          }
-        }
-        out[rz*gridW+cx]=sum/wsum;
-      }
-    }
-    targetY=out;
-  }
-
-  // 欠阻尼弹簧 + 邻域耦合：中心先变形，周围一圈稍晚被带动，读起来更像厚果冻在传播。
-  const springSrc = force ? null : oilSpringY.slice();
+  const cols=OIL_SURFACE.cols,rows=OIL_SURFACE.rows,gridW=cols+1,gridH=rows+1,count=gridW*gridH;
+  if(!oilSpringY||oilSpringY.length!==count){oilSpringY=new Float32Array(count);oilSpringV=new Float32Array(count)}
+  const offsetSrc=force?null:oilSpringY.slice();
   for(let i=0;i<count;i++){
-    const ty=targetY[i];
-    if(force){
-      oilSpringY[i]=ty;
-      oilSpringV[i]=0;
+    const rest=oilRestHeight[i];
+    const elastic=smoothstep01((rest-CFG.heightSpringFadeStart)/Math.max(.001,CFG.heightSpringFull-CFG.heightSpringFadeStart));
+    if(force){oilSpringY[i]=0;oilSpringV[i]=0}
+    else if(elastic<.015){
+      const killV=Math.exp(-22*dt),killY=Math.exp(-18*dt);
+      oilSpringV[i]*=killV;oilSpringY[i]*=killY;
     }else{
-      const cur=springSrc[i];
-      const cx=i%gridW, rz=(i/gridW)|0;
-      let neighborSum=0, neighborCount=0;
-      if(cx>0){ neighborSum+=springSrc[i-1]; neighborCount++; }
-      if(cx<gridW-1){ neighborSum+=springSrc[i+1]; neighborCount++; }
-      if(rz>0){ neighborSum+=springSrc[i-gridW]; neighborCount++; }
-      if(rz<gridH-1){ neighborSum+=springSrc[i+gridW]; neighborCount++; }
-      const neighborAvg = neighborCount ? neighborSum/neighborCount : cur;
-      const displacement=ty-cur;
-      const coupling=(neighborAvg-cur)*OIL_SURFACE.springNeighborCoupling;
-      const accel=displacement*OIL_SURFACE.springStiffness + coupling - oilSpringV[i]*OIL_SURFACE.springDamping;
+      const cur=offsetSrc[i];
+      const cx=i%gridW,rz=(i/gridW)|0;
+      let sum=0,n=0;
+      if(cx>0){sum+=offsetSrc[i-1];n++} if(cx<gridW-1){sum+=offsetSrc[i+1];n++}
+      if(rz>0){sum+=offsetSrc[i-gridW];n++} if(rz<gridH-1){sum+=offsetSrc[i+gridW];n++}
+      const neighbor=n?sum/n:cur;
+      const damping=OIL_SURFACE.springDamping+(1-elastic)*15.0;
+      const accel=(-cur)*OIL_SURFACE.springStiffness +(neighbor-cur)*OIL_SURFACE.springNeighborCoupling*elastic -oilSpringV[i]*damping;
       oilSpringV[i]+=accel*dt;
       oilSpringV[i]=Math.max(-OIL_SURFACE.springMaxSpeed,Math.min(OIL_SURFACE.springMaxSpeed,oilSpringV[i]));
-      oilSpringY[i]=cur + oilSpringV[i]*dt;
+      oilSpringY[i]=cur+oilSpringV[i]*dt;
     }
-
-    arr[i*3+0]=targetX[i];
-    arr[i*3+2]=targetZ[i];
-    arr[i*3+1]=oilSpringY[i];
+    const visible=rest>CFG.heightClearThreshold;
+    const cx=i%gridW,rz=(i/gridW)|0;
+    const p=oilGridWorld(cx,rz);
+    const feather=visible?smoothstep01(rest/CFG.heightRenderFeather):0;
+    const renderRest=rest*feather;
+    const breathe=visible?elastic*feather*(.34*Math.sin(time*.92+p.x*.014+p.z*.010)+.20*Math.sin(time*.61+p.x*.008-p.z*.012)):0;
+    const maxOffset=Math.min(CFG.heightSpringMaxOffsetAbs,Math.max(0,renderRest*CFG.heightSpringMaxOffsetRatio))*elastic*feather;
+    const offset=visible?Math.max(-maxOffset,Math.min(maxOffset,oilSpringY[i])):0;
+    const rendered=visible?Math.max(0,renderRest+offset+breathe):0;
+    arr[i*3+0]=p.x;arr[i*3+2]=p.z;arr[i*3+1]=OIL_SURFACE.surfaceBaseY+rendered;
   }
-
   pos.needsUpdate=true;
   oilMesh.geometry.computeVertexNormals();
   oilSurfaceDirty=false;
 }
-function hideOilCell(c){
-  if(!c||!c.active)return;
-  c.active=false;
-  c.pendingRemoval=false;
-  c.targetStrength=0;
-  c.removedAt=performance.now()/1000;
-  spawnRecoverFlash(c.x,c.z,1.05 + c.noise*.32);
-  oilSurfaceDirty=true;
-}
-function showAllOil(){
-  oilCells.forEach(c=>{c.active=true;c.pendingRemoval=false;c.targetStrength=1;c.visualStrength=1;c.removedAt=-999});
-  oilSurfaceDirty=true;
-  updateOilSurface(performance.now()/1000,true);
-}
-function updateOilJellyVisuals(time,dt){updateOilCellVisuals(dt);updateOilSurface(time,false)}
-
+function hideOilCell(c){if(!c||!c.active)return;c.active=false;c.pendingRemoval=false;c.targetStrength=0;c.removedAt=performance.now()/1000;spawnRecoverFlash(c.x,c.z,1.05+c.noise*.32);oilSurfaceDirty=true}
+function showAllOil(){oilCells.forEach(c=>{c.active=true;c.pendingRemoval=false;c.targetStrength=1;c.visualStrength=1;c.removedAt=-999});oilSurfaceDirty=true;updateOilSurface(performance.now()/1000,true)}
+function updateOilJellyVisuals(time,dt){updateOilSurface(time,false)}
 function spawnRecoverFlash(x,z,scale=1){
   const g=new THREE.Group(); recoverGroup.add(g);
-  // 底层不再做亮黄色闪光，而是先露出一块更深、更湿的地面。
-  const base=new THREE.Mesh(recoverDiscGeo, new THREE.MeshBasicMaterial({color:0x6e5131,transparent:true,opacity:0,depthWrite:false}));
-  base.rotation.x=-Math.PI/2; base.position.y=.06;
-  const darkEdge=new THREE.Mesh(recoverGlowGeo, new THREE.MeshBasicMaterial({color:0x5b4027,transparent:true,opacity:0,depthWrite:false}));
-  darkEdge.rotation.x=-Math.PI/2; darkEdge.position.y=.08;
-  const ring=new THREE.Mesh(recoverRingGeo, new THREE.MeshBasicMaterial({color:0x9e7a4f,transparent:true,opacity:0,depthWrite:false,side:THREE.DoubleSide}));
-  ring.rotation.x=-Math.PI/2; ring.position.y=.12;
-  // 一条扫过去的湿润高光，用来强化“刚从油下面露出来”的质感。
-  const sheen=new THREE.Mesh(recoverSheenGeo, new THREE.MeshBasicMaterial({color:0xfff7dc,transparent:true,opacity:0,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide}));
-  sheen.rotation.x=-Math.PI/2; sheen.position.y=.16;
-  sheen.rotation.z=Math.random()*Math.PI;
-  g.add(base); g.add(darkEdge); g.add(ring); g.add(sheen);
-  recoverEvents.push({g,base,darkEdge,ring,sheen,x,z,start:performance.now()/1000,dur:CFG.recoverFlashDuration,scale,twist:(Math.random()-.5)*.8});
+  const base=new THREE.Mesh(recoverDiscGeo,new THREE.MeshBasicMaterial({color:0x6e5131,transparent:true,opacity:0,depthWrite:false}));base.rotation.x=-Math.PI/2;base.position.y=.06;
+  const darkEdge=new THREE.Mesh(recoverGlowGeo,new THREE.MeshBasicMaterial({color:0x5b4027,transparent:true,opacity:0,depthWrite:false}));darkEdge.rotation.x=-Math.PI/2;darkEdge.position.y=.08;
+  const ring=new THREE.Mesh(recoverRingGeo,new THREE.MeshBasicMaterial({color:0x9e7a4f,transparent:true,opacity:0,depthWrite:false,side:THREE.DoubleSide}));ring.rotation.x=-Math.PI/2;ring.position.y=.12;
+  const sheen=new THREE.Mesh(recoverSheenGeo,new THREE.MeshBasicMaterial({color:0xfff7dc,transparent:true,opacity:0,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide}));sheen.rotation.x=-Math.PI/2;sheen.position.y=.16;sheen.rotation.z=Math.random()*Math.PI;
+  g.add(base);g.add(darkEdge);g.add(ring);g.add(sheen);recoverEvents.push({g,base,darkEdge,ring,sheen,x,z,start:performance.now()/1000,dur:CFG.recoverFlashDuration,scale,twist:(Math.random()-.5)*.8});
 }
 function updateRecoverFlashes(){
   const now=performance.now()/1000;
   for(let i=recoverEvents.length-1;i>=0;i--){
-    const e=recoverEvents[i];
-    const t=Math.max(0,Math.min(1,(now-e.start)/e.dur));
-    const wetIn=smoothstep01(Math.min(1,t/.16));
-    const dryOut=smoothstep01((t-.40)/.60);
-    const survive=1-dryOut;
-    e.g.position.set(e.x,.02,e.z);
-
-    // 主湿地块：先明显变深，再在 1s 左右逐渐干回正常地面。
-    const baseS=18.5*e.scale*(.96 + .18*t);
-    e.base.scale.set(baseS,baseS,1);
-    e.base.material.opacity=(.38 + .18*wetIn) * survive;
-
-    // 边缘更深一点，让湿地区域边界更容易看到，而不是融在亮地面里。
-    const edgeS=22.0*e.scale*(.94 + .22*t);
-    e.darkEdge.scale.set(edgeS,edgeS,1);
-    e.darkEdge.material.opacity=(.16 + .08*wetIn) * (1-smoothstep01((t-.28)/.72));
-
-    // 淡淡一圈暖棕收边，作为“刚清理干净”的句号，但不再用发亮黄环。
-    const ringS=11.5*e.scale*(1+t*2.3);
-    e.ring.scale.set(ringS,ringS,1);
-    e.ring.material.opacity=(.11*(1-t)) * (1-smoothstep01((t-.10)/.90));
-
-    // 湿润高光：前半段更明显，从一侧轻轻扫过，看起来像地表有一层湿膜。
-    const sheenPulse=Math.sin(Math.min(1,t/.42)*Math.PI);
-    const sheenW=(7.5 + 12*t)*e.scale;
-    const sheenH=(1.8 + .25*Math.sin(t*Math.PI*2))*e.scale;
-    e.sheen.scale.set(sheenW,sheenH,1);
-    e.sheen.material.opacity=(.06 + .24*sheenPulse) * (1-smoothstep01((t-.46)/.54));
-    e.sheen.rotation.z += e.twist*.013;
-
-    if(t>=1){
-      recoverGroup.remove(e.g);
-      e.base.material.dispose(); e.darkEdge.material.dispose(); e.ring.material.dispose(); e.sheen.material.dispose();
-      recoverEvents.splice(i,1)
-    }
+    const e=recoverEvents[i];const t=Math.max(0,Math.min(1,(now-e.start)/e.dur));const wetIn=smoothstep01(Math.min(1,t/.16));const dryOut=smoothstep01((t-.40)/.60);const survive=1-dryOut;e.g.position.set(e.x,.02,e.z);
+    const baseS=18.5*e.scale*(.96+.18*t);e.base.scale.set(baseS,baseS,1);e.base.material.opacity=(.38+.18*wetIn)*survive;
+    const edgeS=22.0*e.scale*(.94+.22*t);e.darkEdge.scale.set(edgeS,edgeS,1);e.darkEdge.material.opacity=(.16+.08*wetIn)*(1-smoothstep01((t-.28)/.72));
+    const ringS=11.5*e.scale*(1+t*2.3);e.ring.scale.set(ringS,ringS,1);e.ring.material.opacity=(.11*(1-t))*(1-smoothstep01((t-.10)/.90));
+    const sheenPulse=Math.sin(Math.min(1,t/.42)*Math.PI);const sheenW=(7.5+12*t)*e.scale;const sheenH=(1.8+.25*Math.sin(t*Math.PI*2))*e.scale;e.sheen.scale.set(sheenW,sheenH,1);e.sheen.material.opacity=(.06+.24*sheenPulse)*(1-smoothstep01((t-.46)/.54));e.sheen.rotation.z+=e.twist*.013;
+    if(t>=1){recoverGroup.remove(e.g);e.base.material.dispose();e.darkEdge.material.dispose();e.ring.material.dispose();e.sheen.material.dispose();recoverEvents.splice(i,1)}
   }
 }
-
-// Target feedback
 const rippleGroup=new THREE.Group();scene.add(rippleGroup);const rippleMeshes=[];
 for(let i=0;i<5;i++){const r=new THREE.Mesh(new THREE.RingGeometry(10,12,32),new THREE.MeshBasicMaterial({color:0xf2d8a0,transparent:true,opacity:0,side:THREE.DoubleSide}));r.rotation.x=-Math.PI/2;rippleGroup.add(r);rippleMeshes.push(r)}
 const stream=new THREE.Mesh(new THREE.CylinderGeometry(5,7,1,10),new THREE.MeshStandardMaterial({color:0x111319,roughness:.20,metalness:.05,transparent:true,opacity:.38}));stream.visible=false;stream.castShadow=true;scene.add(stream);
-
 const oilFlowGroup=new THREE.Group();scene.add(oilFlowGroup);
 const oilFlowGeo=new THREE.SphereGeometry(1,14,10);
-const oilFlowBaseMat=new THREE.MeshPhysicalMaterial({
-  color:0x11141a,roughness:.14,metalness:.02,clearcoat:.78,clearcoatRoughness:.12,
-  transparent:true,opacity:.94
-});
+const oilFlowBaseMat=new THREE.MeshPhysicalMaterial({color:0x11141a,roughness:.14,metalness:.02,clearcoat:.78,clearcoatRoughness:.12,transparent:true,opacity:.94});
 const oilFlows=[];
-const oilFlowPhases=[0,.14,.29,.45,.62,.79];
-const oilFlowSides=[-1,-.45,.35,1,.65,-.75];
-const oilFlowSpeeds=[1.04,1.11,.98,1.16,1.07,1.13];
-// 6 股油流里故意混入“小/中/大”油团：3 小、2 中、1 大，避免所有粒子像复制粘贴。
-const oilFlowSizes=[.72,.84,.90,1.02,1.16,1.48];
+const oilFlowPhases=[0,.14,.29,.45,.62,.79];const oilFlowSides=[-1,-.45,.35,1,.65,-.75];const oilFlowSpeeds=[1.04,1.11,.98,1.16,1.07,1.13];const oilFlowSizes=[.72,.84,.90,1.02,1.16,1.48];
 for(let f=0;f<6;f++){
-  const blob=new THREE.Mesh(oilFlowGeo,oilFlowBaseMat.clone());
-  blob.castShadow=true;blob.visible=false;oilFlowGroup.add(blob);
-  const tails=[];
-  for(let j=0;j<7;j++){
-    const t=new THREE.Mesh(oilFlowGeo,oilFlowBaseMat.clone());
-    t.castShadow=false;t.visible=false;t.material.opacity=.72-j*.07;
-    oilFlowGroup.add(t);tails.push(t);
-  }
-  oilFlows.push({
-    blob,tails,
-    phase:oilFlowPhases[f],side:oilFlowSides[f],speed:oilFlowSpeeds[f],size:oilFlowSizes[f],
-    residualT:1,residualActive:false
-  });
+  const blob=new THREE.Mesh(oilFlowGeo,oilFlowBaseMat.clone());blob.castShadow=true;blob.visible=false;oilFlowGroup.add(blob);const tails=[];
+  for(let j=0;j<7;j++){const t=new THREE.Mesh(oilFlowGeo,oilFlowBaseMat.clone());t.castShadow=false;t.visible=false;t.material.opacity=.72-j*.07;oilFlowGroup.add(t);tails.push(t)}
+  oilFlows.push({blob,tails,phase:oilFlowPhases[f],side:oilFlowSides[f],speed:oilFlowSpeeds[f],size:oilFlowSizes[f],residualT:1,residualActive:false});
 }
-let oilFlowWasLive=false;
-let oilFlowSuctionStart=-999;
-let oilFlowResidualStart=-999;
-let oilFlowLastTargetPos=null;
-
-let suctionPulseT=0;
-let suctionPulseStrength=0;
-let nextSuctionPulseAt=-1;
-let suctionPunchT=0;
-let finishPunchT=0;
-let finishPunchTriggered=false;
-let finishSentenceStarted=false;
-
-const collapseGroup=new THREE.Group();scene.add(collapseGroup);
-const collapseEvents=[];
-const collapseGeo=new THREE.SphereGeometry(1,14,10);
-function spawnCollapseEvent(cells,scaleMul=1,isFinish=false){
-  if(!cells||!cells.length)return;
-  let cx=0,cz=0;for(const c of cells){cx+=c.x;cz+=c.z}cx/=cells.length;cz/=cells.length;
-  const n=nozzlePos();
-  if(!isFinish && Math.hypot(cx-n.x,cz-n.z)>CFG.suctionRange*1.6)return;
-  const g=new THREE.Group();collapseGroup.add(g);
-  const parts=[];
-  const offsets=[[0,0,1],[.8,.2,.76],[-.7,.35,.68]];
-  for(let i=0;i<3;i++){
-    const m=new THREE.Mesh(collapseGeo,oilMat.clone());
-    m.castShadow=true;g.add(m);
-    parts.push({mesh:m,ox:offsets[i][0],oz:offsets[i][1],sm:offsets[i][2]});
-  }
-  collapseEvents.push({g,parts,x:cx,z:cz,start:performance.now()/1000,size:(7+cells.length*2.2)*scaleMul,dur:isFinish?.82:CFG.collapseDuration,isFinish});
-}
-function updateCollapseEvents(){
-  const now=performance.now()/1000;
-  for(let i=collapseEvents.length-1;i>=0;i--){
-    const e=collapseEvents[i];
-    const age=now-e.start,t=Math.max(0,Math.min(1,age/e.dur));
-    const n=nozzlePos();
-    let x=e.x,z=e.z,y=10.5,scale=e.size,opacity=.94;
-    if(t<.24){
-      const q=t/.24;
-      const squash=1-.20*smoothstep01(q)+.07*Math.sin(q*Math.PI*2);
-      scale=e.size*squash;
-      y=10.5+Math.sin(q*Math.PI)*4.5;
-    }else{
-      const q=(t-.24)/.76;
-      const ease=q*q*(3-2*q);
-      const dx=n.x-e.x,dz=n.z-e.z,len=Math.hypot(dx,dz)||1;
-      const sx=-dz/len,sz=dx/len;
-      const bend=(e.isFinish?10:5)*Math.sin(q*Math.PI);
-      x=lerp(e.x,n.x,ease)+sx*bend;
-      z=lerp(e.z,n.z,ease)+sz*bend;
-      y=lerp(13,31,ease)+Math.sin(q*Math.PI)*(e.isFinish?12:7);
-      scale=e.size*(1-.72*ease)*(1+.10*Math.sin(q*Math.PI*3));
-      opacity=1-smoothstep01((q-.70)/.30);
-    }
-    e.g.position.set(x,y,z);
-    for(let j=0;j<e.parts.length;j++){
-      const p=e.parts[j];
-      const wob=1+.08*Math.sin(now*12+j*2.1);
-      p.mesh.position.set(p.ox*scale*.42,p.oz*scale*.25,(j-1)*scale*.08);
-      p.mesh.scale.set(scale*p.sm*wob,scale*p.sm*.78,scale*p.sm*1.05);
-      p.mesh.material.opacity=Math.max(0,opacity);
-      p.mesh.material.transparent=true;
-    }
-    if(t>=1){collapseGroup.remove(e.g);for(const p of e.parts)p.mesh.material.dispose();collapseEvents.splice(i,1)}
-  }
-}
-function scheduleNextSuctionPulse(now){
-  const wob=.5+.5*Math.sin(now*2.31+1.17);
-  nextSuctionPulseAt=now+lerp(CFG.suctionPulseMin,CFG.suctionPulseMax,wob);
-}
-function triggerSuctionPulse(){
-  suctionPulseT=CFG.suctionPulseDuration;
-  suctionPunchT=.18;
-  hoseOilFillLen+=118;
-  // 大吸一口：整片边缘先前冲，再撕下一大坨真正飞进吸头。
-  const t=findTarget();
-  if(t){
-    const burst=oilCells
-      .filter(c=>c.active&&!c.pendingRemoval&&dist(c,t)<=CFG.suctionPatchRadius*2.15)
-      .sort((a,b)=>dist(a,t)-dist(b,t))
-      .slice(0,CFG.suctionPulseExtraCells);
-    if(burst.length){
-      queueOilTransfer(burst,true);
-      oilSurfaceDirty=true;
-    }
-  }
-}
-function updateSuctionPulse(dt,now){
-  suctionPulseT=Math.max(0,suctionPulseT-dt);
-  suctionPunchT=Math.max(0,suctionPunchT-dt);
-  finishPunchT=Math.max(0,finishPunchT-dt);
-  suctionPulseStrength=suctionPulseT>0?Math.sin((suctionPulseT/CFG.suctionPulseDuration)*Math.PI):0;
-  if(state==='SUCTION'&&targetCell){
-    if(nextSuctionPulseAt<0)scheduleNextSuctionPulse(now+.25);
-    if(now>=nextSuctionPulseAt){triggerSuctionPulse();scheduleNextSuctionPulse(now)}
-  }else nextSuctionPulseAt=-1;
-}
-function startFinishSentence(){
-  if(finishSentenceStarted)return;
-  finishSentenceStarted=true;finishPunchTriggered=false;
-  const rem=oilCells.filter(c=>c.active);
-  if(rem.length)spawnCollapseEvent(rem.slice(0,Math.min(9,rem.length)),1.7,true);
-}
-function oilFlowLive(){return !!targetCell && (state==='PRESUCTION'||state==='SUCTION')}
-function oilFlowRoot(flow,targetPos){
-  if(!targetPos)return null;
-  const n=nozzlePos();
-  const dir=norm({x:n.x-targetPos.x,z:n.z-targetPos.z});
-  const side={x:-dir.z,z:dir.x};
-  const spread=flow.side*8;
-  return {x:targetPos.x+dir.x*5+side.x*spread,z:targetPos.z+dir.z*5+side.z*spread};
-}
-function bezierPoint(p0,p1,p2,p3,t){
-  const it=1-t;
-  return {
-    x:it*it*it*p0.x+3*it*it*t*p1.x+3*it*t*t*p2.x+t*t*t*p3.x,
-    y:it*it*it*p0.y+3*it*it*t*p1.y+3*it*t*t*p2.y+t*t*t*p3.y,
-    z:it*it*it*p0.z+3*it*it*t*p1.z+3*it*t*t*p2.z+t*t*t*p3.z,
-  };
-}
+let oilFlowWasLive=false,oilFlowSuctionStart=-999,oilFlowResidualStart=-999,oilFlowLastTargetPos=null;
+let suctionPulseT=0,suctionPulseStrength=0,nextSuctionPulseAt=-1,suctionPunchT=0,finishPunchT=0,finishPunchTriggered=false,finishSentenceStarted=false;
+const collapseGroup=new THREE.Group();scene.add(collapseGroup);const collapseEvents=[];const collapseGeo=new THREE.SphereGeometry(1,14,10);
+function spawnCollapseEvent(cells,scaleMul=1,isFinish=false){}
+function updateCollapseEvents(){}
+function scheduleNextSuctionPulse(now){const wob=.5+.5*Math.sin(now*2.31+1.17);nextSuctionPulseAt=now+lerp(CFG.suctionPulseMin,CFG.suctionPulseMax,wob)}
+function triggerSuctionPulse(){suctionPulseT=CFG.suctionPulseDuration;suctionPunchT=.18;hoseOilFillLen+=112;if(targetCell)spawnRemovedOilVisual(targetCell.x,targetCell.z,CFG.oilParticleVolumeStep*1.3,true)}
+function updateSuctionPulse(dt,now){suctionPulseT=Math.max(0,suctionPulseT-dt);suctionPunchT=Math.max(0,suctionPunchT-dt);finishPunchT=Math.max(0,finishPunchT-dt);suctionPulseStrength=suctionPulseT>0?Math.sin((suctionPulseT/CFG.suctionPulseDuration)*Math.PI):0;if(state==='SUCTION'&&targetCell){if(nextSuctionPulseAt<0)scheduleNextSuctionPulse(now+.25);if(now>=nextSuctionPulseAt){triggerSuctionPulse();scheduleNextSuctionPulse(now)}}else nextSuctionPulseAt=-1}
+function startFinishSentence(){if(finishSentenceStarted)return;finishSentenceStarted=true;finishPunchTriggered=false}
+function oilFlowLive(){return !!targetCell&&(state==='PRESUCTION'||state==='SUCTION')}
+function oilFlowRoot(flow,targetPos){if(!targetPos)return null;const n=nozzlePos();const dir=norm({x:n.x-targetPos.x,z:n.z-targetPos.z});const side={x:-dir.z,z:dir.x};const spread=flow.side*8;return{x:targetPos.x+dir.x*5+side.x*spread,z:targetPos.z+dir.z*5+side.z*spread}}
+function bezierPoint(p0,p1,p2,p3,t){const it=1-t;return{x:it*it*it*p0.x+3*it*it*t*p1.x+3*it*t*t*p2.x+t*t*t*p3.x,y:it*it*it*p0.y+3*it*it*t*p1.y+3*it*t*t*p2.y+t*t*t*p3.y,z:it*it*it*p0.z+3*it*it*t*p1.z+3*it*t*t*p2.z+t*t*t*p3.z}}
 function hideOilFlows(){for(const f of oilFlows){f.blob.visible=false;for(const t of f.tails)t.visible=false}}
-function captureOilFlowResidual(now){
-  oilFlowResidualStart=now;
-  // 只保留当下最靠近吸头的 3 个油团继续飞完，停止时不再生成新油团。
-  const ranked=[];
-  for(let i=0;i<oilFlows.length;i++){
-    const flow=oilFlows[i];
-    const speed=(state==='PRESUCTION'?1.15:2.25)*flow.speed;
-    const t=(now*speed+flow.phase)%1;
-    ranked.push({i,t});
-    flow.residualT=t;
-    flow.residualActive=false;
-  }
-  ranked.sort((a,b)=>b.t-a.t).slice(0,3).forEach(v=>oilFlows[v.i].residualActive=true);
-}
+function captureOilFlowResidual(now){oilFlowResidualStart=now;const ranked=[];for(let i=0;i<oilFlows.length;i++){const flow=oilFlows[i];const speed=(state==='PRESUCTION'?1.15:2.25)*flow.speed;const t=(now*speed+flow.phase)%1;ranked.push({i,t});flow.residualT=t;flow.residualActive=false}ranked.sort((a,b)=>b.t-a.t).slice(0,3).forEach(v=>oilFlows[v.i].residualActive=true)}
 function drawOilFlow(flow,fi,targetPos,headT,now,flowStrength,isResidual=false){
-  const n=nozzlePos();
-  const root=oilFlowRoot(flow,targetPos);
-  if(!root){flow.blob.visible=false;for(const q of flow.tails)q.visible=false;return}
-  const dx=n.x-root.x,dz=n.z-root.z,len=Math.hypot(dx,dz)||1;
-  const dirx=dx/len,dirz=dz/len,side={x:-dirz,z:dirx};
-  const lateral=flow.side*(5+2*Math.sin(now*3.1+fi));
-  const p0={x:root.x,y:10.5,z:root.z};
-  const p1={x:root.x+dirx*len*.25+side.x*lateral,y:13.5+fi*.65,z:root.z+dirz*len*.25+side.z*lateral};
-  const p2={x:root.x+dirx*len*.68+side.x*lateral*.45,y:22.0+Math.sin(now*5.0+fi)*1.5,z:root.z+dirz*len*.68+side.z*lateral*.45};
-  const p3={x:n.x,y:31.0,z:n.z};
-  const t=Math.max(0,Math.min(1,headT));
-  const bp=bezierPoint(p0,p1,p2,p3,t);
-  flow.blob.visible=true;
-  flow.blob.position.set(bp.x,bp.y,bp.z);
-  const swell=Math.sin(t*Math.PI);
-  const nearNozzleShrink=1-smoothstep01((t-.80)/.20)*.46;
-  const base=(state==='PRESUCTION'&&!isResidual?3.5:4.55);
-  const burstMul=1+suctionPulseStrength*(fi===0?.62:.22);
-  const blobR=base*flow.size*(0.82+.32*swell)*(1+.07*Math.sin(now*11+fi))*nearNozzleShrink*burstMul;
-  const stretch=1.08+.30*swell;
-  flow.blob.scale.set(blobR,blobR*.88,blobR*stretch);
-  flow.blob.material.opacity=(state==='PRESUCTION'&&!isResidual?.72:.94)*flowStrength;
-  // 油团越大拖尾略长；靠近吸头时拖尾也一起被吞进去。
-  const trailStep=.028 + .008*(1-flow.size);
-  for(let j=0;j<flow.tails.length;j++){
-    const tail=flow.tails[j];
-    const tt=t-(j+1)*trailStep;
-    if(tt<=0){tail.visible=false;continue}
-    const tp=bezierPoint(p0,p1,p2,p3,tt);
-    tail.visible=true;tail.position.set(tp.x,tp.y,tp.z);
-    const fade=(1-j/flow.tails.length)*flowStrength;
-    const tr=blobR*(.62-j*.055)*fade;
-    tail.scale.set(Math.max(.35,tr*.92),Math.max(.30,tr*.72),Math.max(.42,tr*1.12));
-    tail.material.opacity=(state==='PRESUCTION'&&!isResidual?.36:.64)*fade;
-  }
-}
-function updateOilFlowVisual(){
-  const now=performance.now()/1000;
-  const live=oilFlowLive();
-
-  if(live){
-    if(!oilFlowWasLive) oilFlowSuctionStart=now;
-    oilFlowLastTargetPos={x:targetCell.x,z:targetCell.z};
-    oilFlowResidualStart=-999;
-    for(const f of oilFlows)f.residualActive=false;
-  }else if(oilFlowWasLive && oilFlowLastTargetPos){
-    captureOilFlowResidual(now);
-  }
-  oilFlowWasLive=live;
-
-  const residualAge=now-oilFlowResidualStart;
-  const residual=(!live && oilFlowResidualStart>0 && residualAge<.52 && !!oilFlowLastTargetPos);
-  if(!live && !residual){hideOilFlows();return}
-
-  if(live){
-    // 更快建立吸力：约 0.18s 就进入稳定高速流，减少“吸起来慢半拍”的感觉。
-    const age=Math.max(0,now-oilFlowSuctionStart);
-    const ramp=smoothstep01(age/.18);
-    const visibleCount=state==='PRESUCTION'?2:Math.max(2,Math.min(6,2+Math.floor(ramp*4.99)));
-    const baseSpeed=(state==='PRESUCTION'?1.46:lerp(2.12,3.58,ramp))*(1+suctionPulseStrength*.28);
-    const strength=(state==='PRESUCTION'?.78:lerp(.72,1,ramp))*(1+suctionPulseStrength*.20);
-    for(let fi=0;fi<oilFlows.length;fi++){
-      const flow=oilFlows[fi];
-      if(fi>=visibleCount){flow.blob.visible=false;for(const q of flow.tails)q.visible=false;continue}
-      const headT=(now*baseSpeed*flow.speed+flow.phase)%1;
-      drawOilFlow(flow,fi,oilFlowLastTargetPos,headT,now,strength,false);
-    }
-  }else{
-    // 停止吸取后，不立刻消失：保留当时已经“飞起来”的 2~3 个油团，让它们完成剩余路程。
-    const fade=1-smoothstep01(residualAge/.52);
-    for(let fi=0;fi<oilFlows.length;fi++){
-      const flow=oilFlows[fi];
-      if(!flow.residualActive){flow.blob.visible=false;for(const q of flow.tails)q.visible=false;continue}
-      const headT=flow.residualT + residualAge*4.55*flow.speed;
-      if(headT>=1){flow.residualActive=false;flow.blob.visible=false;for(const q of flow.tails)q.visible=false;continue}
-      drawOilFlow(flow,fi,oilFlowLastTargetPos,headT,now,Math.max(.42,fade),true);
-    }
-  }
-}
-
-// 吸取范围可视化：从吸头位置向角色正前方展开的扇形。
-// 当前配置为长度 125、左右各 40°；仅在持管/预吸/正式吸取时显示。
-function makeSuctionRangeGeometry(radius,halfAngle,segments=36){
-  const verts=[0,0,0];
-  for(let i=0;i<=segments;i++){
-    const a=-halfAngle+(halfAngle*2*i/segments);
-    verts.push(Math.sin(a)*radius,0,Math.cos(a)*radius);
-  }
-  const indices=[];
-  for(let i=0;i<segments;i++)indices.push(0,i+1,i+2);
-  const g=new THREE.BufferGeometry();
-  g.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
-  g.setIndex(indices);
-  g.computeVertexNormals();
-  return g;
-}
-function makeSuctionRangeOutline(radius,halfAngle,segments=36){
-  const pts=[new THREE.Vector3(0,0,0)];
-  for(let i=0;i<=segments;i++){
-    const a=-halfAngle+(halfAngle*2*i/segments);
-    pts.push(new THREE.Vector3(Math.sin(a)*radius,0,Math.cos(a)*radius));
-  }
-  pts.push(new THREE.Vector3(0,0,0));
-  return new THREE.BufferGeometry().setFromPoints(pts);
-}
-const suctionRangeGroup=new THREE.Group();
-suctionRangeGroup.position.set(0,2.2,32);
-playerGroup.add(suctionRangeGroup);
-const suctionRangeMat=new THREE.MeshBasicMaterial({color:0xf3c64f,transparent:true,opacity:.20,side:THREE.DoubleSide,depthWrite:false});
-const suctionRangeMesh=new THREE.Mesh(makeSuctionRangeGeometry(CFG.suctionRange,CFG.suctionHalfAngle),suctionRangeMat);
-suctionRangeMesh.renderOrder=3;suctionRangeGroup.add(suctionRangeMesh);
-const suctionRangeLineMat=new THREE.LineBasicMaterial({color:0xffdc72,transparent:true,opacity:.88,depthTest:false});
-const suctionRangeOutline=new THREE.Line(makeSuctionRangeOutline(CFG.suctionRange,CFG.suctionHalfAngle),suctionRangeLineMat);
-suctionRangeOutline.renderOrder=4;suctionRangeGroup.add(suctionRangeOutline);
-// 近身吸附圈补掉扇形原点附近的角度死区，让贴近吸头的石油更容易被吸到。
-const nearRangeMat=new THREE.MeshBasicMaterial({color:0xf3c64f,transparent:true,opacity:.14,side:THREE.DoubleSide,depthWrite:false});
-const nearRangeMesh=new THREE.Mesh(new THREE.CircleGeometry(CFG.nearSuctionRadius,40),nearRangeMat);
-nearRangeMesh.rotation.x=-Math.PI/2; nearRangeMesh.position.y=.03; nearRangeMesh.renderOrder=3; suctionRangeGroup.add(nearRangeMesh);
-const nearRangeLineMat=new THREE.LineBasicMaterial({color:0xffdc72,transparent:true,opacity:.78,depthTest:false});
-const nearPts=[];for(let i=0;i<=40;i++){const a=i/40*Math.PI*2;nearPts.push(new THREE.Vector3(Math.cos(a)*CFG.nearSuctionRadius,.06,Math.sin(a)*CFG.nearSuctionRadius))}
-const nearRangeOutline=new THREE.Line(new THREE.BufferGeometry().setFromPoints(nearPts),nearRangeLineMat);nearRangeOutline.renderOrder=4;suctionRangeGroup.add(nearRangeOutline);
-suctionRangeGroup.visible=false;
-
-let keys={}, touchVec={x:0,z:0}, pointerId=null, joyOrigin=null, showDebug=false;
-let player, state, pickupT, preT, finishT, pullCd, facing, anchors, retractPath, retractDist, targetCell, rewardShown, suctionBudget, shakeT, finishStartCount, cameraShakeCurrent=0, cameraShakeFreqCurrent=11, hoseOilFillLen=0;
-const dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z), dot=(a,b)=>a.x*b.x+a.z*b.z, norm=v=>{const m=Math.hypot(v.x,v.z)||1;return{x:v.x/m,z:v.z/m}}, lerp=(a,b,t)=>a+(b-a)*t;
+  const n=nozzlePos();const root=oilFlowRoot(flow,targetPos);if(!root){flow.blob.visible=false;for(const q of flow.tails)q.visible=false;return}const dx=n.x-root.x,dz=n.z-root.z,len=Math.hypot(dx,dz)||1;const dirx=dx/len,dirz=dz/len,side={x:-dirz,z:dirx};const lateral=flow.side*(5+2*Math.sin(now*3.1+fi));const p0={x:root.x,y:10.5,z:root.z};const p1={x:root.x+dirx*len*.25+side.x*lateral,y:13.5+fi*.65,z:root.z+dirz*len*.25+side.z*lateral};const p2={x:root.x+dirx*len*.68+side.x*lateral*.45,y:22.0+Math.sin(now*5.0+fi)*1.5,z:root.z+dirz*len*.68+side.z*lateral*.45};const p3={x:n.x,y:31.0,z:n.z};const t=Math.max(0,Math.min(1,headT));const bp=bezierPoint(p0,p1,p2,p3,t);flow.blob.visible=true;flow.blob.position.set(bp.x,bp.y,bp.z);const swell=Math.sin(t*Math.PI);const nearNozzleShrink=1-smoothstep01((t-.80)/.20)*.46;const base=(state==='PRESUCTION'&&!isResidual?3.5:4.55);const burstMul=1+suctionPulseStrength*(fi===0?.62:.22);const blobR=base*flow.size*(0.82+.32*swell)*(1+.07*Math.sin(now*11+fi))*nearNozzleShrink*burstMul;const stretch=1.08+.30*swell;flow.blob.scale.set(blobR,blobR*.88,blobR*stretch);flow.blob.material.opacity=(state==='PRESUCTION'&&!isResidual?.72:.94)*flowStrength;const trailStep=.028+.008*(1-flow.size);for(let j=0;j<flow.tails.length;j++){const tail=flow.tails[j];const tt=t-(j+1)*trailStep;if(tt<=0){tail.visible=false;continue}const tp=bezierPoint(p0,p1,p2,p3,tt);tail.visible=true;tail.position.set(tp.x,tp.y,tp.z);const fade=(1-j/flow.tails.length)*flowStrength;const tr=blobR*(.62-j*.055)*fade;tail.scale.set(Math.max(.35,tr*.92),Math.max(.30,tr*.72),Math.max(.42,tr*1.12));tail.material.opacity=(state==='PRESUCTION'&&!isResidual?.36:.64)*fade}}
+function updateOilFlowVisual(){const now=performance.now()/1000;const live=oilFlowLive();if(live){if(!oilFlowWasLive)oilFlowSuctionStart=now;oilFlowLastTargetPos={x:targetCell.x,z:targetCell.z};oilFlowResidualStart=-999;for(const f of oilFlows)f.residualActive=false}else if(oilFlowWasLive&&oilFlowLastTargetPos){captureOilFlowResidual(now)}oilFlowWasLive=live;const residualAge=now-oilFlowResidualStart;const residual=(!live&&oilFlowResidualStart>0&&residualAge<.52&&!!oilFlowLastTargetPos);if(!live&&!residual){hideOilFlows();return}if(live){const age=Math.max(0,now-oilFlowSuctionStart);const ramp=smoothstep01(age/.18);const visibleCount=state==='PRESUCTION'?2:Math.max(2,Math.min(6,2+Math.floor(ramp*4.99)));const baseSpeed=(state==='PRESUCTION'?1.46:lerp(2.12,3.58,ramp))*(1+suctionPulseStrength*.28);const strength=(state==='PRESUCTION'?.78:lerp(.72,1,ramp))*(1+suctionPulseStrength*.20);for(let fi=0;fi<oilFlows.length;fi++){const flow=oilFlows[fi];if(fi>=visibleCount){flow.blob.visible=false;for(const q of flow.tails)q.visible=false;continue}const headT=(now*baseSpeed*flow.speed+flow.phase)%1;drawOilFlow(flow,fi,oilFlowLastTargetPos,headT,now,strength,false)}}else{const fade=1-smoothstep01(residualAge/.52);for(let fi=0;fi<oilFlows.length;fi++){const flow=oilFlows[fi];if(!flow.residualActive){flow.blob.visible=false;for(const q of flow.tails)q.visible=false;continue}const headT=flow.residualT+residualAge*4.55*flow.speed;if(headT>=1){flow.residualActive=false;flow.blob.visible=false;for(const q of flow.tails)q.visible=false;continue}drawOilFlow(flow,fi,oilFlowLastTargetPos,headT,now,Math.max(.42,fade),true)}}}
+function makeSuctionRangeGeometry(radius,halfAngle,segments=36){const verts=[0,0,0];for(let i=0;i<=segments;i++){const a=-halfAngle+(halfAngle*2*i/segments);verts.push(Math.sin(a)*radius,0,Math.cos(a)*radius)}const indices=[];for(let i=0;i<segments;i++)indices.push(0,i+1,i+2);const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));g.setIndex(indices);g.computeVertexNormals();return g}
+function makeSuctionRangeOutline(radius,halfAngle,segments=36){const pts=[new THREE.Vector3(0,0,0)];for(let i=0;i<=segments;i++){const a=-halfAngle+(halfAngle*2*i/segments);pts.push(new THREE.Vector3(Math.sin(a)*radius,0,Math.cos(a)*radius))}pts.push(new THREE.Vector3(0,0,0));return new THREE.BufferGeometry().setFromPoints(pts)}
+const suctionRangeGroup=new THREE.Group();suctionRangeGroup.position.set(0,2.2,32);playerGroup.add(suctionRangeGroup);const suctionRangeMat=new THREE.MeshBasicMaterial({color:0xf3c64f,transparent:true,opacity:.20,side:THREE.DoubleSide,depthWrite:false});const suctionRangeMesh=new THREE.Mesh(makeSuctionRangeGeometry(CFG.suctionRange,CFG.suctionHalfAngle),suctionRangeMat);suctionRangeMesh.renderOrder=3;suctionRangeGroup.add(suctionRangeMesh);const suctionRangeLineMat=new THREE.LineBasicMaterial({color:0xffdc72,transparent:true,opacity:.88,depthTest:false});const suctionRangeOutline=new THREE.Line(makeSuctionRangeOutline(CFG.suctionRange,CFG.suctionHalfAngle),suctionRangeLineMat);suctionRangeOutline.renderOrder=4;suctionRangeGroup.add(suctionRangeOutline);const nearRangeMat=new THREE.MeshBasicMaterial({color:0xf3c64f,transparent:true,opacity:.14,side:THREE.DoubleSide,depthWrite:false});const nearRangeMesh=new THREE.Mesh(new THREE.CircleGeometry(CFG.nearSuctionRadius,40),nearRangeMat);nearRangeMesh.rotation.x=-Math.PI/2;nearRangeMesh.position.y=.03;nearRangeMesh.renderOrder=3;suctionRangeGroup.add(nearRangeMesh);const nearRangeLineMat=new THREE.LineBasicMaterial({color:0xffdc72,transparent:true,opacity:.78,depthTest:false});const nearPts=[];for(let i=0;i<=40;i++){const a=i/40*Math.PI*2;nearPts.push(new THREE.Vector3(Math.cos(a)*CFG.nearSuctionRadius,.06,Math.sin(a)*CFG.nearSuctionRadius))}const nearRangeOutline=new THREE.Line(new THREE.BufferGeometry().setFromPoints(nearPts),nearRangeLineMat);nearRangeOutline.renderOrder=4;suctionRangeGroup.add(nearRangeOutline);suctionRangeGroup.visible=false;
+let keys={},touchVec={x:0,z:0},pointerId=null,joyOrigin=null,showDebug=false;
+let player,state,pickupT,preT,finishT,pullCd,facing,anchors,retractPath,retractDist,targetCell,rewardShown,suctionBudget,shakeT,finishStartCount,cameraShakeCurrent=0,cameraShakeFreqCurrent=11,hoseOilFillLen=0;
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z),dot=(a,b)=>a.x*b.x+a.z*b.z,norm=v=>{const m=Math.hypot(v.x,v.z)||1;return{x:v.x/m,z:v.z/m}},lerp=(a,b,t)=>a+(b-a)*t;
 function clampPlayer(){player.x=Math.max(-WORLD.w/2+24,Math.min(WORLD.w/2-24,player.x));player.z=Math.max(-WORLD.d/2+24,Math.min(WORLD.d/2-24,player.z))}
 function pointInRect(p,r,pad=0){return p.x>r.x-pad&&p.x<r.x+r.w+pad&&p.z>r.z-pad&&p.z<r.z+r.d+pad}
-function segmentsIntersect(a,b,c,d){const ccw=(p1,p2,p3)=>(p3.z-p1.z)*(p2.x-p1.x)>(p2.z-p1.z)*(p3.x-p1.x);return ccw(a,c,d)!==ccw(b,c,d)&&ccw(a,b,c)!==ccw(a,b,d)}
-function segIntersectsRect(a,b,r,pad=0){const rr={x:r.x-pad,z:r.z-pad,w:r.w+pad,d:r.d+pad};if(pointInRect(a,rr)||pointInRect(b,rr))return true;const e=[[{x:rr.x,z:rr.z},{x:rr.x+rr.w,z:rr.z}],[{x:rr.x+rr.w,z:rr.z},{x:rr.x+rr.w,z:rr.z+rr.d}],[{x:rr.x+rr.w,z:rr.z+rr.d},{x:rr.x,z:rr.z+rr.d}],[{x:rr.x,z:rr.z+rr.d},{x:rr.x,z:rr.z}]];return e.some(v=>segmentsIntersect(a,b,v[0],v[1]))}
-function circleRectCollide(p,rad,r){const cx=Math.max(r.x,Math.min(p.x,r.x+r.w)),cz=Math.max(r.z,Math.min(p.z,r.z+r.d));return (p.x-cx)**2+(p.z-cz)**2<rad*rad}
-function activeOilDensityAt(x,z){
-  let density=0;
-  for(const c of oilCells){
-    if(!c.active)continue;
-    const dx=x-c.x,dz=z-c.z;
-    const r=OIL_SURFACE.influenceRadius + c.noise*10;
-    const d2=dx*dx+dz*dz;
-    if(d2>=r*r)continue;
-    const d=Math.sqrt(d2);
-    const q=1-d/r;
-    density += q*q*(.82+.75*q);
-  }
-  return density;
-}
-function oilCollisionCircleCenter(p){
-  // 与画面中的近身圆形吸取范围保持同一中心偏移。
-  return {
-    x:p.x + facing.x*CFG.oilCollisionForwardOffset,
-    z:p.z + facing.z*CFG.oilCollisionForwardOffset
-  };
-}
-function isOilBlocking(p){
-  const center=oilCollisionCircleCenter(p);
-  const radius=CFG.oilCollisionRadius;
-  const samples=CFG.oilCollisionSamples;
-  // 中心 + 半径中圈 + 外圈采样。逻辑仍按 active Oil Cell 判断，吸掉后立即开放。
-  if(activeOilDensityAt(center.x,center.z)>=OIL_SURFACE.threshold*.92)return true;
-  for(const ringMul of [.52,1]){
-    const rr=radius*ringMul;
-    for(let i=0;i<samples;i++){
-      const a=(i/samples)*Math.PI*2;
-      const sx=center.x+Math.cos(a)*rr;
-      const sz=center.z+Math.sin(a)*rr;
-      if(activeOilDensityAt(sx,sz)>=OIL_SURFACE.threshold*.92)return true;
-    }
-  }
-  return false;
-}
-function canStand(p){
-  if(p.x<-WORLD.w/2+20||p.x>WORLD.w/2-20||p.z<-WORLD.d/2+20||p.z>WORLD.d/2-20)return false;
-  for(const r of obstacles)if(circleRectCollide(p,CFG.playerRadius,r))return false;
-  return !isOilBlocking(p);
-}
+function circleRectCollide(p,rad,r){const cx=Math.max(r.x,Math.min(p.x,r.x+r.w)),cz=Math.max(r.z,Math.min(p.z,r.z+r.d));return(p.x-cx)**2+(p.z-cz)**2<rad*rad}
+function canStand(p){if(p.x<-WORLD.w/2+20||p.x>WORLD.w/2-20||p.z<-WORLD.d/2+20||p.z>WORLD.d/2-20)return false;for(const r of obstacles)if(circleRectCollide(p,CFG.playerRadius,r))return false;return sampleOilRestHeight(p.x,p.z)<CFG.heightCollisionThreshold}
 function getInput(){let x=(keys.ArrowRight||keys.d?1:0)-(keys.ArrowLeft||keys.a?1:0),z=(keys.ArrowDown||keys.s?1:0)-(keys.ArrowUp||keys.w?1:0);x+=touchVec.x;z+=touchVec.z;const m=Math.hypot(x,z);if(m>1){x/=m;z/=m}return{x,z}}
-function ropePoints(){return [machine,...anchors,player]}
+function ropePoints(){return[machine,...anchors,player]}
 function ropeLength(){const p=ropePoints();let l=0;for(let i=1;i<p.length;i++)l+=dist(p[i-1],p[i]);return l}
 function lastQ(){return anchors.length?anchors[anchors.length-1]:machine}
-function updateAnchors(){
-  if(!['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state))return;
-  let changed=true;while(changed&&anchors.length){changed=false;const base=anchors.length>1?anchors[anchors.length-2]:machine;const blocked=obstacles.some(o=>segIntersectsRect(base,player,o,CFG.hosePad));if(!blocked){anchors.pop();changed=true}}
-  const base=anchors.length?anchors[anchors.length-1]:machine;const hit=obstacles.find(o=>segIntersectsRect(base,player,o,CFG.hosePad));
-  if(hit&&!pointInRect(base,hit,CFG.hosePad+1)){
-    const p=CFG.hosePad+5,corners=[{x:hit.x-p,z:hit.z-p},{x:hit.x+hit.w+p,z:hit.z-p},{x:hit.x+hit.w+p,z:hit.z+hit.d+p},{x:hit.x-p,z:hit.z+hit.d+p}];let best=null,score=1e9;
-    for(const c of corners){const s=dist(base,c)+dist(c,player);if(s<score){score=s;best=c}} if(best&&(!anchors.length||dist(best,anchors[anchors.length-1])>10)&&anchors.length<9)anchors.push(best);
-  }
-}
-function movePlayer(dt,input){
-  if(state==='FINISH')return;let speed=CFG.baseSpeed;if(['CARRY','PRESUCTION','SUCTION'].includes(state))speed*=CFG.carrySpeedMul;let vx=input.x*speed,vz=input.z*speed;if(Math.hypot(input.x,input.z)>.08)facing=norm(input);
-  if(['CARRY','PRESUCTION','SUCTION'].includes(state)){
-    updateAnchors();const L=ropeLength(),R=L/CFG.hoseLimit,q=lastQ(),away=norm({x:player.x-q.x,z:player.z-q.z});const awayAmt=Math.max(0,vx*away.x+vz*away.z);
-    if(R>=CFG.tensionStart&&awayAmt>0){const t=Math.min(1,(R-CFG.tensionStart)/(1-CFG.tensionStart)),mul=lerp(1,CFG.minAwayMul,t);vx-=away.x*awayAmt*(1-mul);vz-=away.z*awayAmt*(1-mul)}
-    if(R>=1&&awayAmt>0){const add=Math.max(0,vx*away.x+vz*away.z);vx-=away.x*add;vz-=away.z*add;if(pullCd<=0){player.x-=away.x*CFG.pullbackDistance;player.z-=away.z*CFG.pullbackDistance;pullCd=CFG.pullbackCooldown;shakeT=.16;showToast('软管达到极限')}}
-  }
-  const nx={x:player.x+vx*dt,z:player.z};if(canStand(nx))player.x=nx.x;const nz={x:player.x,z:player.z+vz*dt};if(canStand(nz))player.z=nz.z;clampPlayer();
-}
+function updateAnchors(){}
+function movePlayer(dt,input){if(state==='FINISH')return;let speed=CFG.baseSpeed;if(['CARRY','PRESUCTION','SUCTION'].includes(state))speed*=CFG.carrySpeedMul;let vx=input.x*speed,vz=input.z*speed;if(Math.hypot(input.x,input.z)>.08)facing=norm(input);const nx={x:player.x+vx*dt,z:player.z};if(canStand(nx))player.x=nx.x;const nz={x:player.x,z:player.z+vz*dt};if(canStand(nz))player.z=nz.z;clampPlayer()}
 function nozzlePos(){return{x:player.x+facing.x*32,z:player.z+facing.z*32}}
-function updateOilTongueVisual(){
-  const live=(state==='PRESUCTION'||state==='SUCTION')&&!!targetCell;
-  oilTongueGroup.visible=live;
-  if(!live){for(const m of oilTongueNodes)m.visible=false;return}
-  const now=performance.now()/1000;
-  const n=nozzlePos();
-  const p0={x:targetCell.x,y:10.5,z:targetCell.z};
-  const vx=n.x-p0.x,vz=n.z-p0.z,len=Math.hypot(vx,vz)||1;
-  const dirx=vx/len,dirz=vz/len,side={x:-dirz,z:dirx};
-  const bend=Math.sin(now*5.2)*3.6*(1+.35*suctionPulseStrength);
-  const p1={x:p0.x+dirx*len*.28+side.x*bend,y:13.5,z:p0.z+dirz*len*.28+side.z*bend};
-  const p2={x:p0.x+dirx*len*.70-side.x*bend*.35,y:22.5,z:p0.z+dirz*len*.70-side.z*bend*.35};
-  const p3={x:n.x,y:31,z:n.z};
-  for(let i=0;i<oilTongueNodes.length;i++){
-    const m=oilTongueNodes[i],t=(i+.35)/(oilTongueNodes.length-.25);
-    const p=bezierPoint(p0,p1,p2,p3,t);
-    m.visible=true;m.position.set(p.x,p.y,p.z);
-    const root=1-t,neck=.60+.40*Math.abs(t-.58)/.58;
-    const pulseBulge=1+suctionPulseStrength*(.48*Math.exp(-Math.pow((t-.58)/.19,2))+.10);
-    const r=(3.6+8.4*root)*neck*pulseBulge;
-    m.scale.set(r,r*(.74+.12*Math.sin(now*8+i)),r*1.18);
-    m.material.opacity=state==='PRESUCTION'?.78:.98;
-    m.material.transparent=true;
-  }
+function updateOilTongueVisual(){oilTongueGroup.visible=false}
+function queueOilTransfer(cells,burst=false){}
+function updateOilTransfers(now){}
+function spawnRemovedOilVisual(x,z,removedAmount,burst=false){}
+function smoothHeightFieldErosion(dt,centerX,centerZ){
+  if(!oilRestHeight)return{removed:0,weightedX:0,weightedZ:0,weight:0};const cols=OIL_SURFACE.cols,rows=OIL_SURFACE.rows,gridW=cols+1;const radius=CFG.heightErosionSmoothRadius;const alpha=1-Math.pow(1-CFG.heightErosionSmoothAlpha,Math.max(.45,dt*60));const slopeAlpha=1-Math.pow(1-CFG.heightSlopeClampAlpha,Math.max(.45,dt*60));let removed=0,weightedX=0,weightedZ=0,weight=0;
+  for(let pass=0;pass<CFG.heightErosionSmoothPasses;pass++){const src=oilRestHeight.slice();for(let rz=0;rz<=rows;rz++){for(let cx=0;cx<=cols;cx++){const i=oilGridIndex(cx,rz),h=src[i];if(h<=0)continue;const p=oilGridWorld(cx,rz);if(Math.hypot(p.x-centerX,p.z-centerZ)>radius)continue;let sum=0,wsum=0,minNeighbor=Infinity;for(let dz=-1;dz<=1;dz++){const zz=rz+dz;if(zz<0||zz>rows)continue;for(let dx=-1;dx<=1;dx++){const xx=cx+dx;if(xx<0||xx>cols||(dx===0&&dz===0))continue;const nh=src[oilGridIndex(xx,zz)];const w=(dx===0||dz===0)?2:1;sum+=nh*w;wsum+=w;if(nh<minNeighbor)minNeighbor=nh}}if(!wsum)continue;const avg=sum/wsum;let next=h;if(avg<h)next=Math.min(next,lerp(h,avg,alpha));if(Number.isFinite(minNeighbor)){const maxAllowed=minNeighbor+CFG.heightMaxNeighborSlope;if(next>maxAllowed)next=Math.min(next,lerp(next,maxAllowed,slopeAlpha))}if(next>0&&next<CFG.heightThinFastStart){const thin=1-next/CFG.heightThinFastStart;next=Math.max(0,next-CFG.heightSuctionSpeed*(CFG.heightThinFastMul-1)*thin*dt*.48)}if(next<CFG.heightThinSnap)next=0;if(next<oilRestHeight[i]){const delta=oilRestHeight[i]-next;oilRestHeight[i]=next;removed+=delta;weightedX+=p.x*delta;weightedZ+=p.z*delta;weight+=delta}}}}
+  return{removed,weightedX,weightedZ,weight};
 }
-
-function queueOilTransfer(cells,burst=false){
-  const picked=(cells||[]).filter(c=>c&&c.active&&!c.pendingRemoval);
-  if(!picked.length)return;
-  let sx=0,sz=0;
-  for(const c of picked){c.pendingRemoval=true;sx+=c.x;sz+=c.z}
-  sx/=picked.length;sz/=picked.length;
-  const g=new THREE.Group();oilTransferGroup.add(g);
-  const parts=[];
-  const count=burst?4:2;
-  for(let i=0;i<count;i++){
-    const m=new THREE.Mesh(oilTransferGeo,oilMat.clone());
-    m.castShadow=true;m.material.transparent=true;g.add(m);parts.push(m);
-  }
-  oilTransferEvents.push({
-    g,parts,cells:picked,x:sx,z:sz,start:performance.now()/1000,
-    dur:burst?CFG.oilTransferBurstDuration:CFG.oilTransferDuration,burst
-  });
+function applyHeightFieldSuction(dt){
+  if(state!=='SUCTION'||!oilRestHeight)return 0;const n=nozzlePos();const pulseMul=1+suctionPulseStrength*(CFG.heightSuctionPulseMul-1);const impulseMul=1+suctionPulseStrength*(CFG.springPulseImpulseMul-1);const cols=OIL_SURFACE.cols,rows=OIL_SURFACE.rows,gridW=cols+1;let removed=0,weightedX=0,weightedZ=0,weight=0;
+  for(let rz=0;rz<=rows;rz++){for(let cx=0;cx<=cols;cx++){const i=oilGridIndex(cx,rz),rest=oilRestHeight[i];if(rest<=CFG.heightClearThreshold)continue;const p=oilGridWorld(cx,rz);const vx=p.x-n.x,vz=p.z-n.z,d=Math.hypot(vx,vz);if(!pointInSuctionZoneXZ(p.x,p.z))continue;const radial=Math.max(0,1-d/CFG.heightSuctionRadius);const edgeBrush=smoothstep01(radial);const brush=d<=CFG.heightSuctionNearRadius?1:Math.pow(edgeBrush,1.55);const initial=Math.max(1,oilInitialRestHeight[i]||rest);const ratio=Math.max(0,Math.min(1,rest/initial));const thin=1-smoothstep01((ratio-.06)/.48);const thinBoost=1+(CFG.heightThinFastMul-1)*thin;const amount=Math.min(rest,CFG.heightSuctionSpeed*pulseMul*thinBoost*(.08+.92*brush)*dt);if(amount<=0)continue;const prev=rest;oilRestHeight[i]=Math.max(0,rest-amount);if(oilRestHeight[i]<CFG.heightThinSnap)oilRestHeight[i]=0;const actual=prev-oilRestHeight[i];removed+=actual;weightedX+=p.x*actual;weightedZ+=p.z*actual;weight+=actual;const elastic=smoothstep01((prev-CFG.heightSpringFadeStart)/Math.max(.001,CFG.heightSpringFull-CFG.heightSpringFadeStart));if(elastic>.01){oilSpringV[i]-=CFG.springSuctionImpulse*impulseMul*elastic*(.28+.72*brush)*dt;const kick=-CFG.springSuctionImpulse*CFG.springNeighborImpulse*impulseMul*elastic*(.20+.80*brush)*dt;if(cx>0)oilSpringV[i-1]+=kick;if(cx<cols)oilSpringV[i+1]+=kick;if(rz>0)oilSpringV[i-gridW]+=kick;if(rz<rows)oilSpringV[i+gridW]+=kick}}}
+  const smooth=smoothHeightFieldErosion(dt,n.x,n.z);removed+=smooth.removed;weightedX+=smooth.weightedX;weightedZ+=smooth.weightedZ;weight+=smooth.weight;if(removed>0){oilSurfaceDirty=true;oilParticleVolumeBudget+=removed}return removed;
 }
-
-function updateOilTransfers(now){
-  for(let i=oilTransferEvents.length-1;i>=0;i--){
-    const e=oilTransferEvents[i];
-    const t=Math.max(0,Math.min(1,(now-e.start)/e.dur));
-    const n=nozzlePos();
-    const dx=n.x-e.x,dz=n.z-e.z,len=Math.hypot(dx,dz)||1,dirx=dx/len,dirz=dz/len;
-    const hold=e.burst?.20:.14;
-    const q=smoothstep01(Math.max(0,(t-hold)/(1-hold)));
-    const p0={x:e.x,y:11.5,z:e.z};
-    const p1={x:e.x+dirx*len*.28,y:16+(e.burst?5:2),z:e.z+dirz*len*.28};
-    const p2={x:e.x+dirx*len*.72,y:25+(e.burst?6:3),z:e.z+dirz*len*.72};
-    const p3={x:n.x,y:31,z:n.z};
-    const p=bezierPoint(p0,p1,p2,p3,q);
-    e.g.position.set(p.x,p.y,p.z);
-
-    const stretch=1+.72*Math.sin(Math.min(1,t/Math.max(.001,hold))*Math.PI);
-    const shrink=1-smoothstep01((q-.72)/.28)*.72;
-    const base=(e.burst?6.8:5.2)*(1+.07*e.cells.length);
-    for(let j=0;j<e.parts.length;j++){
-      const m=e.parts[j],a=j/(e.parts.length-1||1);
-      const wob=1+.08*Math.sin(now*14+j*2.1);
-      const r=base*(1-.18*a)*shrink*wob;
-      m.position.set((j-(e.parts.length-1)/2)*r*.44,Math.sin(now*10+j)*1.2,(a-.5)*r*.36);
-      m.scale.set(r*stretch,r*.78,r*1.05);
-      m.material.opacity=Math.max(0,.98-smoothstep01((q-.78)/.22)*.92);
-    }
-
-    // 油坨一脱离主体，主体体积就同步下降，避免“主体还在 + 又生成一坨”的视觉复制。
-    if(t>.10){
-      const fade=1-smoothstep01((t-.10)/.68);
-      for(const c of e.cells)c.targetStrength=Math.min(c.targetStrength,Math.max(.04,fade));
-      oilSurfaceDirty=true;
-    }
-    if(t>=1){
-      for(const c of e.cells)hideOilCell(c);
-      oilTransferGroup.remove(e.g);
-      for(const m of e.parts)m.material.dispose();
-      oilTransferEvents.splice(i,1);
-    }
-  }
-}
-
-function inSuctionZone(c){
-  if(!c||!c.active||c.pendingRemoval)return false;
-  const n=nozzlePos(),v={x:c.x-n.x,z:c.z-n.z},d=Math.hypot(v.x,v.z);
-  // 近身圆：解决油就在吸头旁边却因为扇形角度而检测不到的问题。
-  if(d<=CFG.nearSuctionRadius)return true;
-  if(d>CFG.suctionRange||d<1)return false;
-  const nv={x:v.x/d,z:v.z/d};
-  return Math.acos(Math.max(-1,Math.min(1,dot(nv,facing))))<=CFG.suctionHalfAngle;
-}
-function findTarget(){const n=nozzlePos();let best=null,bd=1e9;for(const c of oilCells){if(!inSuctionZone(c))continue;const d=dist(c,n);if(d<bd){bd=d;best=c}}return best}
-function validTarget(c){return inSuctionZone(c)}
-function advectOilTowardNozzle(dt){
-  // 不再修改逻辑 Cell 的 x/z。
-  // 原方案把多个 metaball 核压到一起，会抬高密度，让整片油越吸越大。
-  // 现在“向吸头移动”只做视觉形变；逻辑油量只会减少。
-  if(state==='SUCTION'&&targetCell)oilSurfaceDirty=true;
-}
-
-function clearSuctionPatch(center){
-  // 连续吸取先把一坨油拉离主体并飞向吸头，到达后才真正删除。
-  const local=oilCells.filter(c=>c.active&&!c.pendingRemoval&&dist(c,center)<=CFG.suctionPatchRadius*1.20).sort((a,b)=>dist(a,center)-dist(b,center));
-  if(!local.length)return;
-  queueOilTransfer(local.slice(0,1),false);
-  autoCleanResidualIslands();
-}
-function autoCleanResidualIslands(){
-  // 极小残油也走同一条“脱离→飞入吸头”路径，不再原地消失。
-  const active=oilCells.filter(c=>c.active&&!c.pendingRemoval);
-  const visited=new Set();
-  const tiny=[];
-  for(const start of active){
-    if(visited.has(start.index))continue;
-    const stack=[start],comp=[];visited.add(start.index);
-    while(stack.length){const cur=stack.pop();comp.push(cur);for(const other of active){if(visited.has(other.index))continue;if(dist(cur,other)<=CFG.residualLinkRadius){visited.add(other.index);stack.push(other)}}}
-    if(comp.length<=CFG.residualIslandMaxCells)tiny.push(...comp);
-  }
-  if(tiny.length)queueOilTransfer(tiny,false);
-}
-function suctionStep(dt){
-  if(!validTarget(targetCell))targetCell=findTarget();if(!targetCell){preT=0;if(state==='PRESUCTION'||state==='SUCTION')state='CARRY';return}
-  if(state==='CARRY'){state='PRESUCTION';preT=0}if(state==='PRESUCTION'){preT+=dt;if(preT>=CFG.preSuction){state='SUCTION';preT=CFG.preSuction}}
-  if(state==='SUCTION'){advectOilTowardNozzle(dt);suctionBudget+=CFG.suctionCellsPerSec*dt;while(suctionBudget>=1){suctionBudget--;const t=findTarget();if(!t)break;clearSuctionPatch(t);targetCell=findTarget()}const remaining=oilCells.reduce((n,c)=>n+(c.active?1:0),0);if(remaining/initialOilCount<=CFG.cleanupThreshold){state='FINISH';finishT=0;finishStartCount=remaining;targetCell=null;startFinishSentence()}}
-}
+function drainHeightFieldFinish(dt){if(!oilRestHeight)return;const rate=5.4*dt;for(let i=0;i<oilRestHeight.length;i++){const prev=oilRestHeight[i];if(prev<=0)continue;oilRestHeight[i]=Math.max(0,prev*(1-rate)-18*dt);oilSpringV[i]-=42*dt}oilSurfaceDirty=true}
+function inSuctionZone(c){if(!c)return false;if(c.index!==undefined&&oilRestHeight&&oilRestHeight[c.index]<=CFG.heightClearThreshold)return false;return pointInSuctionZoneXZ(c.x,c.z)}
+function findTarget(){return findHeightFieldTarget()}
+function validTarget(c){return!!c&&inSuctionZone(c)}
+function advectOilTowardNozzle(dt){if(state==='SUCTION'&&targetCell)oilSurfaceDirty=true}
+function clearSuctionPatch(center){}
+function autoCleanResidualIslands(){}
+function suctionStep(dt){if(!validTarget(targetCell))targetCell=findTarget();if(!targetCell){preT=0;if(state==='PRESUCTION'||state==='SUCTION')state='CARRY';return}if(state==='CARRY'){state='PRESUCTION';preT=0}if(state==='PRESUCTION'){preT+=dt;if(preT>=CFG.preSuction){state='SUCTION';preT=CFG.preSuction}}if(state==='SUCTION'){applyHeightFieldSuction(dt);targetCell=findTarget();const remaining=oilRemainingRatio();if(remaining<=CFG.cleanupThreshold){state='FINISH';finishT=0;finishStartCount=remaining;targetCell=null;startFinishSentence()}}}
 function polyLength(pts){let l=0;for(let i=1;i<pts.length;i++)l+=dist(pts[i-1],pts[i]);return l}
 function pointOnPolylineInfo(pts,d){if(!pts.length)return{p:machine,i:0};for(let i=0;i<pts.length-1;i++){const s=dist(pts[i],pts[i+1]);if(d<=s){const t=s?d/s:0;return{p:{x:lerp(pts[i].x,pts[i+1].x,t),z:lerp(pts[i].z,pts[i+1].z,t)},i}}d-=s}return{p:pts[pts.length-1],i:pts.length-2}}
 function beginRetract(){retractPath=ropePoints().map(p=>({x:p.x,z:p.z})).reverse();retractDist=0;anchors=[];state='RETRACT';targetCell=null;preT=0}
 function dropHose(){if(['CARRY','PRESUCTION','SUCTION'].includes(state))beginRetract()}
 function updateRetract(dt){if(state!=='RETRACT')return;retractDist+=CFG.retractSpeed*dt;if(retractDist>=polyLength(retractPath)){state='IDLE';pickupT=0;retractPath=[]}}
-function reset(){player={x:-430,z:235};facing={x:0,z:-1};state='IDLE';pickupT=0;preT=0;finishT=0;pullCd=0;anchors=[];retractPath=[];retractDist=0;targetCell=null;rewardShown=false;suctionBudget=0;shakeT=0;cameraShakeCurrent=0;cameraShakeFreqCurrent=CFG.cameraShakeFreqCarry;hoseOilFillLen=0;oilFlowWasLive=false;oilFlowSuctionStart=-999;oilFlowResidualStart=-999;oilFlowLastTargetPos=null;suctionPulseT=0;suctionPulseStrength=0;nextSuctionPulseAt=-1;suctionPunchT=0;finishPunchT=0;finishPunchTriggered=false;finishSentenceStarted=false;for(const e of collapseEvents.splice(0)){collapseGroup.remove(e.g);for(const q of e.parts)q.mesh.material.dispose()}for(const e of recoverEvents.splice(0)){recoverGroup.remove(e.g);e.base.material.dispose();e.darkEdge.material.dispose();e.ring.material.dispose();e.sheen.material.dispose()}for(const e of oilTransferEvents.splice(0)){oilTransferGroup.remove(e.g);for(const m of e.parts)m.material.dispose()}oilTongueGroup.visible=false;for(const m of oilTongueNodes)m.visible=false;for(const f of oilFlows){f.residualActive=false;f.residualT=1}hideOilFlows();buildOil();updateVisuals();updateUI()}
-
-function update(dt){
-  const nowSec=performance.now()/1000;
-  pullCd=Math.max(0,pullCd-dt);shakeT=Math.max(0,shakeT-dt);const input=getInput();movePlayer(dt,input);
-  if(state==='IDLE'){if(dist(player,machine)<=CFG.interactionRange){state='PICKUP';pickupT=0}}
-  else if(state==='PICKUP'){if(dist(player,machine)>CFG.interactionRange){state='IDLE';pickupT=0}else{pickupT+=dt;if(pickupT>=CFG.interactionDuration){state='CARRY';pickupT=CFG.interactionDuration;lampMat.emissive.setHex(0x8b5f12);showToast('已拿起吸头')}}}
-  else if(['CARRY','PRESUCTION','SUCTION'].includes(state)){updateAnchors();suctionStep(dt)}
-  else if(state==='FINISH'){
-    finishT+=dt; const progress=Math.min(1,finishT/CFG.finishDuration); const desired=Math.floor(finishStartCount*(1-progress)); let active=oilCells.filter(c=>c.active); while(active.length>desired){hideOilCell(active.pop())}
-    if(progress>=.70&&!finishPunchTriggered){finishPunchTriggered=true;finishPunchT=.26;hoseOilFillLen+=135;}
-    if(finishT>=CFG.finishDuration){oilCells.forEach(c=>hideOilCell(c));if(!rewardShown){rewardShown=true;showToast('获得 100 桶石油')}beginRetract()}
-  }
-  updateSuctionPulse(dt,nowSec);updateOilTransfers(nowSec);updateCollapseEvents();updateRecoverFlashes();
-  updateRetract(dt); updateHoseFlow(dt); updateOilJellyVisuals(nowSec,dt); updateVisuals(); updateUI();
-}
-
+function reset(){player={x:-430,z:235};facing={x:0,z:-1};state='IDLE';pickupT=0;preT=0;finishT=0;pullCd=0;anchors=[];retractPath=[];retractDist=0;targetCell=null;rewardShown=false;suctionBudget=0;shakeT=0;cameraShakeCurrent=0;cameraShakeFreqCurrent=CFG.cameraShakeFreqCarry;hoseOilFillLen=0;oilParticleVolumeBudget=0;oilFlowWasLive=false;oilFlowSuctionStart=-999;oilFlowResidualStart=-999;oilFlowLastTargetPos=null;suctionPulseT=0;suctionPulseStrength=0;nextSuctionPulseAt=-1;suctionPunchT=0;finishPunchT=0;finishPunchTriggered=false;finishSentenceStarted=false;for(const e of collapseEvents.splice(0)){collapseGroup.remove(e.g)}for(const e of recoverEvents.splice(0)){recoverGroup.remove(e.g)}oilTongueGroup.visible=false;for(const m of oilTongueNodes)m.visible=false;for(const f of oilFlows){f.residualActive=false;f.residualT=1}hideOilFlows();buildOil();updateVisuals();updateUI()}
+function update(dt){const nowSec=performance.now()/1000;pullCd=Math.max(0,pullCd-dt);shakeT=Math.max(0,shakeT-dt);const input=getInput();movePlayer(dt,input);if(state==='IDLE'){if(dist(player,machine)<=CFG.interactionRange){state='PICKUP';pickupT=0}}else if(state==='PICKUP'){if(dist(player,machine)>CFG.interactionRange){state='IDLE';pickupT=0}else{pickupT+=dt;if(pickupT>=CFG.interactionDuration){state='CARRY';pickupT=CFG.interactionDuration;lampMat.emissive.setHex(0x8b5f12);showToast('已拿起吸头')}}}else if(['CARRY','PRESUCTION','SUCTION'].includes(state)){suctionStep(dt)}else if(state==='FINISH'){finishT+=dt;const progress=Math.min(1,finishT/CFG.finishDuration);drainHeightFieldFinish(dt);if(progress>=.70&&!finishPunchTriggered){finishPunchTriggered=true;finishPunchT=.26;hoseOilFillLen+=135}if(finishT>=CFG.finishDuration){if(oilRestHeight)oilRestHeight.fill(0);oilSurfaceDirty=true;if(!rewardShown){rewardShown=true;showToast('获得 100 桶石油')}beginRetract()}}updateSuctionPulse(dt,nowSec);updateRecoverFlashes();updateRetract(dt);updateHoseFlow(dt);updateOilJellyVisuals(nowSec,dt);updateVisuals();updateUI()}
 function setCylinderBetween(mesh,a,b,radiusScale=1){const va=new THREE.Vector3(a.x,a.y,a.z),vb=new THREE.Vector3(b.x,b.y,b.z),mid=va.clone().add(vb).multiplyScalar(.5),dir=vb.clone().sub(va),len=dir.length();mesh.position.copy(mid);mesh.scale.set(radiusScale,len,radiusScale);mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),dir.normalize())}
-function currentRopeVisualPoints(){
-  if(['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state))return ropePoints();
-  if(state==='RETRACT'&&retractPath.length){const info=pointOnPolylineInfo(retractPath,retractDist);const remain=retractPath.slice(info.i+1).reverse();return [machine,...remain,info.p]}
-  return [];
-}
-function colorLerp(a,b,t){return a.clone().lerp(b,Math.max(0,Math.min(1,t)))}
-function updateHoseFlow(dt){
-  const pts=currentRopeVisualPoints();
-  const currentLen=Math.max(0, polyLength(pts));
-  if(state==='SUCTION' || state==='FINISH') hoseOilFillLen += CFG.hoseOilFillSpeed*dt;
-  else hoseOilFillLen -= CFG.hoseOilDrainSpeed*dt;
-  hoseOilFillLen=Math.max(0, Math.min(hoseOilFillLen, currentLen));
-}
-function updateRopeVisual(){
-  const pts=currentRopeVisualPoints();
-  const totalLen=polyLength(pts);
-  let acc=0;
-  const carrying=['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state);
-  const ropeRatio=carrying && CFG.hoseLimit>0 ? Math.min(1, ropeLength()/CFG.hoseLimit) : 0;
-  const tensionAlpha=carrying && ropeRatio>=CFG.tensionStart ? Math.min(1,(ropeRatio-CFG.tensionStart)/(1-CFG.tensionStart)) : 0;
-  const now=performance.now()/1000;
-  const pulse=(Math.sin(now*11.5)+1)*.5;
-  // 拉力阶段只轻微闪红，避免把蓝色软管整体染成粉色。
-  const flashAlpha=tensionAlpha>0 ? (.03 + .10*pulse) * (.30 + .70*tensionAlpha) : 0;
-
-  for(let i=0;i<ropeSegments.length;i++){
-    const s=ropeSegments[i];
-    if(i<pts.length-1){
-      s.visible=true;
-      const a=pts[i], b=pts[i+1];
-      setCylinderBetween(s,{x:a.x,y:24,z:a.z},{x:b.x,y:26,z:b.z});
-      const segLen=dist(a,b);
-      const midFromMachine=acc + segLen*.5;
-      const midFromNozzle=totalLen - midFromMachine;
-      // 颜色前沿从吸头朝吸油机推进/回退，形成沿整根软管逐步流动的渐变。
-      let fillT=(hoseOilFillLen - midFromNozzle + CFG.hoseFlowTransition*.5)/CFG.hoseFlowTransition;
-      fillT=Math.max(0, Math.min(1, fillT));
-      let col=colorLerp(ropeBaseColor, ropeOilColor, fillT);
-
-      // 在已吸入的管段上增加缓慢移动的高光，像管内液体正在流动。
-      let flowGlow=0;
-      if(fillT>0.02){
-        const wave=0.5 + 0.5*Math.sin(now*12.5 - midFromNozzle*0.09);
-        const shimmer=Math.max(0,(wave-.58)/.42);
-        const nearFront=Math.max(0,1-Math.abs(hoseOilFillLen-midFromNozzle)/(CFG.hoseFlowTransition*1.1));
-        flowGlow=(.08 + .16*nearFront + .12*shimmer) * fillT;
-        col.lerp(ropeFlowHighlightColor, Math.min(.38, flowGlow));
-      }
-
-      if(flashAlpha>0) col.lerp(ropeTensionColor, flashAlpha);
-      s.material.color.copy(col);
-      s.material.emissive.copy(colorLerp(new THREE.Color(0x000000), ropeFlowHighlightColor, Math.min(.20, flowGlow)));
-      if(flashAlpha>0){
-        s.material.emissive.r = Math.min(.12, s.material.emissive.r + flashAlpha*.12);
-      }
-      acc += segLen;
-    } else s.visible=false
-  }
-  while(anchorGroup.children.length)anchorGroup.remove(anchorGroup.children[0]);if(['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state)){for(const a of anchors){const m=new THREE.Mesh(new THREE.SphereGeometry(5,8,6),new THREE.MeshBasicMaterial({color:0xf3b944}));m.position.set(a.x,29,a.z);anchorGroup.add(m)}}
-}
-function updateFeedbackVisuals(){
-  const rangeVisible=['CARRY','PRESUCTION','SUCTION'].includes(state);
-  suctionRangeGroup.visible=rangeVisible;
-  // 检测到有效油面时变绿，让“范围命中”一眼可见。
-  const rangeHit=rangeVisible&&!!findTarget();
-  suctionRangeMat.color.setHex(rangeHit?0x56d984:0xf3c64f);
-  suctionRangeLineMat.color.setHex(rangeHit?0x78f0a0:0xffdc72);
-  nearRangeMat.color.setHex(rangeHit?0x56d984:0xf3c64f);
-  nearRangeLineMat.color.setHex(rangeHit?0x78f0a0:0xffdc72);
-  suctionRangeMat.opacity=rangeHit?.27:.20; nearRangeMat.opacity=rangeHit?.20:.14;
-
-  rippleGroup.visible=state==='PRESUCTION'&&!!targetCell;if(rippleGroup.visible){rippleGroup.position.set(targetCell.x,4.7,targetCell.z);const t=preT/CFG.preSuction;rippleMeshes.forEach((r,i)=>{const phase=(t+i*.2)%1;r.scale.setScalar(.8+phase*2.4);r.material.opacity=.45*(1-phase)})}
-  // 吸头前的主体表现交给史莱姆拉丝，避免这条吸流柱看起来像一根黑管。
-  stream.visible=(state==='FINISH');if(stream.visible){let tx,tz;const act=oilCells.filter(c=>c.active);if(act.length){tx=act.reduce((n,c)=>n+c.x,0)/act.length;tz=act.reduce((n,c)=>n+c.z,0)/act.length}else{const n=nozzlePos();tx=n.x+facing.x*60;tz=n.z+facing.z*60}const n=nozzlePos();setCylinderBetween(stream,{x:tx,y:8,z:tz},{x:n.x,y:30,z:n.z},0.72)}
-  updateOilFlowVisual();
-}
-function updateVisuals(){
-  playerGroup.position.set(player.x,0,player.z);playerGroup.rotation.y=Math.atan2(facing.x,facing.z);nozzle.visible=['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state);
-  pickupRing.visible=state==='IDLE'||state==='PICKUP';updateRopeVisual();updateFeedbackVisuals();updateNozzleVortexVisual();updateOilTongueVisual();
-  // camera follows without changing yaw, so touch movement stays intuitive.
-  // 拿起吸头后机器持续运转：持管阶段保持极轻微震屏；正式吸油和收尾阶段明显加强。
-  const camX=player.x*.24, camZ=player.z*.18+650;
-  const baseCam=new THREE.Vector3(camX,610,camZ);
-  camera.position.lerp(baseCam,.06);
-
-  const t=performance.now()/1000;
-  let targetShake=0, targetFreq=CFG.cameraShakeFreqCarry;
-  if(state==='CARRY'){ targetShake=CFG.cameraShakeCarry; targetFreq=CFG.cameraShakeFreqCarry; }
-  else if(state==='PRESUCTION'){ targetShake=CFG.cameraShakePreSuction; targetFreq=CFG.cameraShakeFreqPreSuction; }
-  else if(state==='SUCTION'){ targetShake=CFG.cameraShakeSuction; targetFreq=CFG.cameraShakeFreqSuction; }
-  else if(state==='FINISH'){ targetShake=CFG.cameraShakeFinish; targetFreq=CFG.cameraShakeFreqFinish; }
-
-  // 平滑过渡，避免拿起/开始吸油瞬间像“镜头被敲了一下”。
-  const blend=1-Math.exp(-CFG.cameraShakeBlendSpeed/60);
-  cameraShakeCurrent=lerp(cameraShakeCurrent,targetShake,blend);
-  cameraShakeFreqCurrent=lerp(cameraShakeFreqCurrent,targetFreq,blend);
-
-  const look=new THREE.Vector3(player.x*.20,0,player.z*.20-40);
-  if(camera.fov!==47){ camera.fov=47; camera.updateProjectionMatrix(); }
-  camera.lookAt(look);
-
-  if(cameraShakeCurrent>.005){
-    // 持续机械震动改成“屏幕空间上下为主”。
-    // 原因：机器运转需要稳定、可读的振动方向；多轴随机晃更像爆炸/受击。
-    const f=cameraShakeFreqCurrent;
-    const vertical=(Math.sin(t*f*1.03)*.72 + Math.sin(t*f*2.17)*.28) * cameraShakeCurrent;
-    const lateral=(Math.sin(t*f*.83+1.2)*.10 + Math.sin(t*f*1.91)*.05) * cameraShakeCurrent;
-    camera.translateY(vertical);
-    camera.translateX(lateral);
-  }
-
-  // 周期性“大吸一口”和最后一口都给一个很短的冲击，不改变持续震动的基线。
-  if(suctionPunchT>0){
-    const q=suctionPunchT/.18;
-    camera.translateY(Math.sin((1-q)*Math.PI)*1.8*q);
-    camera.translateZ(-1.1*q);
-  }
-  if(finishPunchT>0){
-    const q=finishPunchT/.26;
-    camera.translateY(Math.sin((1-q)*Math.PI)*3.0*q);
-    camera.translateZ(-2.2*q);
-  }
-
-  // 极限软管拉回仍然用多方向短冲击，与“持续机器震动”区分开。
-  if(shakeT>0){
-    const impulse=shakeT/.16;
-    camera.translateX(Math.sin(t*58)*5.2*impulse);
-    camera.translateY(Math.cos(t*71)*3.2*impulse);
-    camera.translateZ(Math.sin(t*64)*2.5*impulse);
-  }
-}
-function updateUI(){
-  const carrying=['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state);dropBtn.style.display=carrying?'block':'none';dropBtn.disabled=state==='FINISH';dropBtn.style.opacity=state==='FINISH'?'.45':'1';pickupBar.style.display=state==='PICKUP'?'block':'none';pickupFill.style.width=(Math.min(1,pickupT/CFG.interactionDuration)*100)+'%';
-  const texts={IDLE:['靠近吸油机拿取吸头','进入黄色交互圈并停留，系统自动拿管。'],PICKUP:['正在拿取吸头','离开交互圈会立即清零。'],CARRY:['持管移动','靠近油面边缘，并让角色面朝油面。'],PRESUCTION:['预吸建立中','保持朝向，波纹结束后自动正式吸取。'],SUCTION:['正在吸油','油面退缩后，裸露地面即可进入。'],FINISH:['残油自动收尾','达到隐藏阈值：移动锁定，残油自动汇聚清空。'],RETRACT:['软管自动回收','回收完成前不能重新拿管。']};statusEl.textContent=texts[state][0];hintEl.textContent=texts[state][1];
-  if(carrying){const R=ropeLength()/CFG.hoseLimit;tensionBadge.textContent=R>=1?'软管：极限':R>=CFG.tensionStart?'软管：受力':'软管：松弛';tensionBadge.style.background=R>=1?'#6d2d2a':R>=CFG.tensionStart?'#6b5528':'#2d4932'}else{tensionBadge.textContent='软管：未连接';tensionBadge.style.background='#2d343c'}
-  if(showDebug){const rem=oilCells.reduce((n,c)=>n+(c.active?1:0),0);debugEl.innerHTML=`<b>3D MVP 调试</b><br>state: ${state}<br>hose: ${carrying?ropeLength().toFixed(0):0} / ${CFG.hoseLimit}<br>anchors: ${anchors.length}<br>oil cells: ${rem} / ${initialOilCount}<br>pre-suction: ${preT.toFixed(2)}s<br>camera shake: ${cameraShakeCurrent.toFixed(2)} / freq ${cameraShakeFreqCurrent.toFixed(1)}<br>suction range: near ${CFG.nearSuctionRadius} + forward ${CFG.suctionRange} / ±${(CFG.suctionHalfAngle*180/Math.PI).toFixed(0)}°<br>oil collision circle: r=${CFG.oilCollisionRadius} / offset ${CFG.oilCollisionForwardOffset}<br><span style="color:#9aa7b4">H 隐藏</span>`}
-}
+function currentRopeVisualPoints(){if(['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state))return ropePoints();if(state==='RETRACT'&&retractPath.length){const info=pointOnPolylineInfo(retractPath,retractDist);const remain=retractPath.slice(info.i+1).reverse();return[machine,...remain,info.p]}return[]}
+function colorLerp(a,b,t){return a.clone().lerp(Math.max(0,Math.min(1,t)))}
+function updateHoseFlow(dt){const pts=currentRopeVisualPoints();const currentLen=Math.max(0,polyLength(pts));if(state==='SUCTION'||state==='FINISH')hoseOilFillLen+=CFG.hoseOilFillSpeed*dt;else hoseOilFillLen-=CFG.hoseOilDrainSpeed*dt;hoseOilFillLen=Math.max(0,Math.min(hoseOilFillLen,currentLen))}
+function updateRopeVisual(){const pts=currentRopeVisualPoints();for(let i=0;i<ropeSegments.length;i++){const s=ropeSegments[i];if(i<pts.length-1){s.visible=true;const a=pts[i],b=pts[i+1];setCylinderBetween(s,{x:a.x,y:24,z:a.z},{x:b.x,y:26,z:b.z})}else s.visible=false}}
+function updateFeedbackVisuals(){const rangeVisible=['CARRY','PRESUCTION','SUCTION'].includes(state);suctionRangeGroup.visible=rangeVisible;const rangeHit=rangeVisible&&!!findTarget();suctionRangeMat.color.setHex(rangeHit?0x56d984:0xf3c64f);suctionRangeLineMat.color.setHex(rangeHit?0x78f0a0:0xffdc72);nearRangeMat.color.setHex(rangeHit?0x56d984:0xf3c64f);nearRangeLineMat.color.setHex(rangeHit?0x78f0a0:0xffdc72);suctionRangeMat.opacity=rangeHit?.27:.20;nearRangeMat.opacity=rangeHit?.20:.14;rippleGroup.visible=state==='PRESUCTION'&&!!targetCell;if(rippleGroup.visible){rippleGroup.position.set(targetCell.x,4.7,targetCell.z)}stream.visible=false;updateOilFlowVisual()}
+function updateVisuals(){playerGroup.position.set(player.x,0,player.z);playerGroup.rotation.y=Math.atan2(facing.x,facing.z);nozzle.visible=['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state);pickupRing.visible=state==='IDLE'||state==='PICKUP';updateRopeVisual();updateFeedbackVisuals();updateNozzleVortexVisual();const camX=player.x*.24,camZ=player.z*.18+650;const baseCam=new THREE.Vector3(camX,610,camZ);camera.position.lerp(baseCam,.06);const look=new THREE.Vector3(player.x*.20,0,player.z*.20-40);camera.lookAt(look)}
+function updateUI(){const carrying=['CARRY','PRESUCTION','SUCTION','FINISH'].includes(state);dropBtn.style.display=carrying?'block':'none';pickupBar.style.display=state==='PICKUP'?'block':'none';pickupFill.style.width=(Math.min(1,pickupT/CFG.interactionDuration)*100)+'%';const texts={IDLE:['靠近吸油机拿取吸头','进入黄色交互圈并停留，系统自动拿管。'],PICKUP:['正在拿取吸头','离开交互圈会立即清零。'],CARRY:['持管移动','靠近油面边缘，并让角色面朝油面。'],PRESUCTION:['预吸建立中','保持朝向，波纹结束后自动正式吸取。'],SUCTION:['正在吸油','油面正在连续变薄。'],FINISH:['残油自动收尾','剩余油量很低，自动清空。'],RETRACT:['软管自动回收','回收完成前不能重新拿管。']};statusEl.textContent=texts[state][0];hintEl.textContent=texts[state][1]}
 function showToast(msg){toast.textContent=msg;toast.style.opacity=1;clearTimeout(showToast.t);showToast.t=setTimeout(()=>toast.style.opacity=0,1300)}
-
 function resize(){const r=stage.getBoundingClientRect();renderer.setSize(r.width,r.height,false);camera.aspect=r.width/r.height;camera.updateProjectionMatrix()}
-window.addEventListener('resize',resize);resize();
-window.addEventListener('keydown',e=>{keys[e.key]=true;if(e.key.toLowerCase()==='h'){showDebug=!showDebug;debugEl.classList.toggle('hidden',!showDebug);updateUI()}if(e.key===' '){dropHose();e.preventDefault()}});
-window.addEventListener('keyup',e=>keys[e.key]=false);dropBtn.addEventListener('click',dropHose);resetBtn.addEventListener('click',()=>{reset();showToast('场景已重置')});
-renderer.domElement.addEventListener('pointerdown',e=>{pointerId=e.pointerId;renderer.domElement.setPointerCapture(e.pointerId);const r=renderer.domElement.getBoundingClientRect();joyOrigin={x:e.clientX-r.left,y:e.clientY-r.top};joystick.style.left=joyOrigin.x+'px';joystick.style.top=joyOrigin.y+'px';joystick.style.display='block'});
-renderer.domElement.addEventListener('pointermove',e=>{if(e.pointerId!==pointerId||!joyOrigin)return;const r=renderer.domElement.getBoundingClientRect(),dx=e.clientX-r.left-joyOrigin.x,dy=e.clientY-r.top-joyOrigin.y,m=Math.hypot(dx,dy),max=40,k=m>max?max/m:1;touchVec={x:(dx*k)/max,z:(dy*k)/max};stick.style.transform=`translate(calc(-50% + ${dx*k}px),calc(-50% + ${dy*k}px))`});
-function endPointer(e){if(e.pointerId!==pointerId)return;pointerId=null;joyOrigin=null;touchVec={x:0,z:0};joystick.style.display='none';stick.style.transform='translate(-50%,-50%)'}renderer.domElement.addEventListener('pointerup',endPointer);renderer.domElement.addEventListener('pointercancel',endPointer);
-
-reset();let last=performance.now();
-function loop(now){const dt=Math.min(.033,(now-last)/1000);last=now;update(dt);renderer.render(scene,camera);requestAnimationFrame(loop)}requestAnimationFrame(loop);
+window.addEventListener('resize',resize);resize();window.addEventListener('keydown',e=>{keys[e.key]=true;if(e.key===' '){dropHose();e.preventDefault()}});window.addEventListener('keyup',e=>keys[e.key]=false);dropBtn.addEventListener('click',dropHose);resetBtn.addEventListener('click',()=>reset());
+reset();let last=performance.now();function loop(now){const dt=Math.min(.033,(now-last)/1000);last=now;update(dt);renderer.render(scene,camera);requestAnimationFrame(loop)}requestAnimationFrame(loop);
 })();
 </script>
 </body>
