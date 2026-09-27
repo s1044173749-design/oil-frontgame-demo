@@ -101,7 +101,16 @@ const CFG = {
   pressureWaveAmp: 2.8,
   pressureWaveWidth: 22,
   pressureWaveSpeed: 108,
-  recoverFlashDuration: 1.35
+  recoverFlashDuration: 1.35,
+  // V0.1 oil-mass pull: nearby logical oil cells are physically advected toward the nozzle.
+  oilAdvectionRadius: 152,
+  oilAdvectionSpeed: 24,
+  oilAdvectionPulseMul: 2.1,
+  oilAdvectionStopDistance: 20,
+  suctionDentRadius: 58,
+  suctionDentDepth: 3.2,
+  suctionDentPulseDepth: 7.2,
+  suctionPulseExtraCells: 3
 };
 const WORLD = {w:1200, d:700};
 
@@ -440,6 +449,7 @@ function oilTractionAt(x,z,time){
   const t=1-d/OIL_SURFACE.tractionRadius;
   const pulse=.84 + .16*Math.sin(time*10.5 + d*.08);
   let strength = (state==='PRESUCTION') ? 2.6 : (state==='SUCTION' ? 4.3 : 3.4);
+  if(state==='SUCTION') strength*=1+suctionPulseStrength*.72;
   return Math.pow(t,1.65) * strength * pulse;
 }
 function oilStringTractionAt(x,z,time){
@@ -471,12 +481,14 @@ function oilStringTractionAt(x,z,time){
   const tip=Math.exp(-Math.pow((normalized-.92)/.11,2));
   const suctionPulse=.88 + .12*Math.sin(time*15.0 - along*0.11) + .05*Math.sin(time*22.0 - along*0.17);
   const stateMul = state==='PRESUCTION' ? .72 : state==='SUCTION' ? 1.18 : 1.0;
+  const gulpPullMul=state==='SUCTION' ? 1+suctionPulseStrength*1.05 : 1;
+  const gulpLiftMul=state==='SUCTION' ? 1+suctionPulseStrength*.42 : 1;
 
   // 水平牵引远大于垂直抬升，视觉上像被吸头“拽过去”，而不是往上长。
   const horizontalProfile=(root*.7 + neck*2.2 + tip*1.4) * (.52+.32*normalized);
   const liftProfile=(root*.35 + neck*.8 + tip*.45) * (.50+.20*normalized);
-  const pull= strand * horizontalProfile * suctionPulse * stateMul;
-  const lift= strand * liftProfile * suctionPulse * stateMul;
+  const pull= strand * horizontalProfile * suctionPulse * stateMul * gulpPullMul;
+  const lift= strand * liftProfile * suctionPulse * stateMul * gulpLiftMul;
   return {x:dirx*pull,z:dirz*pull,lift};
 }
 function oilBackflowAt(x,z,time){
@@ -535,6 +547,16 @@ function oilVolumeBulgeAt(x,z,time){
   const pulse=.84 + .16*Math.sin(time*10.2 + d*.07);
   const stateMul=state==='PRESUCTION'?.76:state==='SUCTION'?1.22:.98;
   return (Math.pow(ring,1.08)*.82 + Math.pow(shoulder,1.45)*.46) * pulse * CFG.volumeBulgeAmp * stateMul;
+}
+function oilSuctionDentAt(x,z){
+  if(state!=='SUCTION' || !targetCell) return 0;
+  const n=nozzlePos();
+  const cx=lerp(targetCell.x,n.x,.22), cz=lerp(targetCell.z,n.z,.22);
+  const d=Math.hypot(x-cx,z-cz);
+  if(d>=CFG.suctionDentRadius) return 0;
+  const q=1-d/CFG.suctionDentRadius;
+  const depth=CFG.suctionDentDepth + CFG.suctionDentPulseDepth*suctionPulseStrength;
+  return -Math.pow(q,1.65)*depth;
 }
 function oilPressureWaveAt(x,z,time){
   if(!(state==='PRESUCTION' || state==='SUCTION' || state==='FINISH')) return 0;
@@ -634,7 +656,8 @@ function updateOilSurface(time,force=false){
       const volumeBulge=oilVolumeBulgeAt(baseX,baseZ,time);
       const pressureWave=oilPressureWaveAt(baseX,baseZ,time);
       const backflow=oilBackflowAt(baseX,baseZ,time);
-      h += rebound + traction + stringPull.lift + peel.lift + volumeBulge + pressureWave + backflow;
+      const suctionDent=oilSuctionDentAt(baseX,baseZ);
+      h += rebound + traction + stringPull.lift + peel.lift + volumeBulge + pressureWave + backflow + suctionDent;
 
       const edgePull=Math.pow(edge,.62);
       targetX[vi]=baseX + (stringPull.x + peel.x)*edgePull;
@@ -876,10 +899,20 @@ function scheduleNextSuctionPulse(now){
 function triggerSuctionPulse(){
   suctionPulseT=CFG.suctionPulseDuration;
   suctionPunchT=.18;
-  hoseOilFillLen+=52;
-  // 大吸一口时额外吞掉 1 个最近的 Cell，让视觉爆点与实际清理同步一点。
+  hoseOilFillLen+=92;
+  // “大吸一口”不再只是镜头反馈：局部油团先被整体拽向吸头，再一次吞入 3 个 Cell。
   const t=findTarget();
-  if(t){const extra=oilCells.filter(c=>c.active&&dist(c,t)<=CFG.suctionPatchRadius*1.35).sort((a,b)=>dist(a,t)-dist(b,t))[0];if(extra)hideOilCell(extra)}
+  if(t){
+    const burst=oilCells
+      .filter(c=>c.active&&dist(c,t)<=CFG.suctionPatchRadius*1.75)
+      .sort((a,b)=>dist(a,t)-dist(b,t))
+      .slice(0,CFG.suctionPulseExtraCells);
+    if(burst.length){
+      spawnCollapseEvent(burst,1.22,false);
+      burst.forEach(hideOilCell);
+      oilSurfaceDirty=true;
+    }
+  }
 }
 function updateSuctionPulse(dt,now){
   suctionPulseT=Math.max(0,suctionPulseT-dt);
@@ -1138,6 +1171,31 @@ function inSuctionZone(c){
 }
 function findTarget(){const n=nozzlePos();let best=null,bd=1e9;for(const c of oilCells){if(!inSuctionZone(c))continue;const d=dist(c,n);if(d<bd){bd=d;best=c}}return best}
 function validTarget(c){return inSuctionZone(c)}
+function advectOilTowardNozzle(dt){
+  if(state!=='SUCTION' || !targetCell)return;
+  const n=nozzlePos();
+  const focus={x:targetCell.x,z:targetCell.z};
+  const pulseMul=1+suctionPulseStrength*CFG.oilAdvectionPulseMul;
+  let moved=false;
+  for(const c of oilCells){
+    if(!c.active)continue;
+    const fd=Math.hypot(c.x-focus.x,c.z-focus.z);
+    if(fd>=CFG.oilAdvectionRadius)continue;
+    const dx=n.x-c.x,dz=n.z-c.z,d=Math.hypot(dx,dz);
+    if(d<=CFG.oilAdvectionStopDistance)continue;
+    const influence=Math.pow(1-fd/CFG.oilAdvectionRadius,1.55);
+    const step=Math.min(
+      CFG.oilAdvectionSpeed*influence*pulseMul*dt,
+      Math.max(0,d-CFG.oilAdvectionStopDistance)
+    );
+    if(step<=0)continue;
+    c.x+=dx/d*step;
+    c.z+=dz/d*step;
+    moved=true;
+  }
+  if(moved)oilSurfaceDirty=true;
+}
+
 function clearSuctionPatch(center){
   // 一次吸取不是“抠一个像素点”，而是清掉一个小局部，避免锯齿状缺口。
   const local=oilCells.filter(c=>c.active&&dist(c,center)<=CFG.suctionPatchRadius).sort((a,b)=>dist(a,center)-dist(b,center));
@@ -1161,7 +1219,7 @@ function autoCleanResidualIslands(){
 function suctionStep(dt){
   if(!validTarget(targetCell))targetCell=findTarget();if(!targetCell){preT=0;if(state==='PRESUCTION'||state==='SUCTION')state='CARRY';return}
   if(state==='CARRY'){state='PRESUCTION';preT=0}if(state==='PRESUCTION'){preT+=dt;if(preT>=CFG.preSuction){state='SUCTION';preT=CFG.preSuction}}
-  if(state==='SUCTION'){suctionBudget+=CFG.suctionCellsPerSec*dt;while(suctionBudget>=1){suctionBudget--;const t=findTarget();if(!t)break;clearSuctionPatch(t);targetCell=findTarget()}const remaining=oilCells.reduce((n,c)=>n+(c.active?1:0),0);if(remaining/initialOilCount<=CFG.cleanupThreshold){state='FINISH';finishT=0;finishStartCount=remaining;targetCell=null;startFinishSentence()}}
+  if(state==='SUCTION'){advectOilTowardNozzle(dt);suctionBudget+=CFG.suctionCellsPerSec*dt;while(suctionBudget>=1){suctionBudget--;const t=findTarget();if(!t)break;clearSuctionPatch(t);targetCell=findTarget()}const remaining=oilCells.reduce((n,c)=>n+(c.active?1:0),0);if(remaining/initialOilCount<=CFG.cleanupThreshold){state='FINISH';finishT=0;finishStartCount=remaining;targetCell=null;startFinishSentence()}}
 }
 function polyLength(pts){let l=0;for(let i=1;i<pts.length;i++)l+=dist(pts[i-1],pts[i]);return l}
 function pointOnPolylineInfo(pts,d){if(!pts.length)return{p:machine,i:0};for(let i=0;i<pts.length-1;i++){const s=dist(pts[i],pts[i+1]);if(d<=s){const t=s?d/s:0;return{p:{x:lerp(pts[i].x,pts[i+1].x,t),z:lerp(pts[i].z,pts[i+1].z,t)},i}}d-=s}return{p:pts[pts.length-1],i:pts.length-2}}
