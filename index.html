@@ -103,19 +103,20 @@ const CFG = {
   pressureWaveSpeed: 108,
   recoverFlashDuration: 1.35,
   // V0.1 oil-mass pull: nearby logical oil cells are physically advected toward the nozzle.
+  // V0.1 V2.1：逻辑油量不再被持续压缩，只做视觉牵引，避免“越吸越大”
   oilAdvectionRadius: 168,
-  oilAdvectionSpeed: 74,
-  oilAdvectionPulseMul: 2.6,
+  oilAdvectionSpeed: 0,
+  oilAdvectionPulseMul: 0,
   oilAdvectionStopDistance: 18,
-  oilMassPullRadius: 176,
-  oilMassPullDistance: 31,
-  oilMassPulseDistance: 24,
-  suctionDentRadius: 64,
-  suctionDentDepth: 3.8,
-  suctionDentPulseDepth: 9.4,
-  suctionPulseExtraCells: 5,
-  oilTransferDuration: .30,
-  oilTransferBurstDuration: .40
+  oilMassPullRadius: 158,
+  oilMassPullDistance: 18,
+  oilMassPulseDistance: 10,
+  suctionDentRadius: 60,
+  suctionDentDepth: 4.2,
+  suctionDentPulseDepth: 7.4,
+  suctionPulseExtraCells: 4,
+  oilTransferDuration: .24,
+  oilTransferBurstDuration: .34
 };
 const WORLD = {w:1200, d:700};
 
@@ -576,7 +577,8 @@ function oilMassPullAt(x,z){
   const influence=Math.pow(1-d/CFG.oilMassPullRadius,1.35);
   const stateMul=state==='PRESUCTION'?.42:1;
   const pull=(CFG.oilMassPullDistance+CFG.oilMassPulseDistance*suctionPulseStrength)*influence*stateMul;
-  const lift=(4.0+5.5*suctionPulseStrength)*Math.pow(influence,1.6)*stateMul;
+  // 这里只做“向前拉”，不再额外把油顶高；高度主要交给凹陷/拉丝表现。
+  const lift=.35*Math.pow(influence,1.7)*stateMul;
   return {x:dirx*pull,z:dirz*pull,lift};
 }
 function oilSuctionDentAt(x,z){
@@ -1211,7 +1213,7 @@ function updateOilTongueVisual(){
     m.visible=true;m.position.set(p.x,p.y,p.z);
     const root=1-t,neck=.60+.40*Math.abs(t-.58)/.58;
     const pulseBulge=1+suctionPulseStrength*(.48*Math.exp(-Math.pow((t-.58)/.19,2))+.10);
-    const r=(4.2+10.8*root)*neck*pulseBulge;
+    const r=(3.6+8.4*root)*neck*pulseBulge;
     m.scale.set(r,r*(.74+.12*Math.sin(now*8+i)),r*1.18);
     m.material.opacity=state==='PRESUCTION'?.78:.98;
     m.material.transparent=true;
@@ -1226,7 +1228,7 @@ function queueOilTransfer(cells,burst=false){
   sx/=picked.length;sz/=picked.length;
   const g=new THREE.Group();oilTransferGroup.add(g);
   const parts=[];
-  const count=burst?5:3;
+  const count=burst?4:2;
   for(let i=0;i<count;i++){
     const m=new THREE.Mesh(oilTransferGeo,oilMat.clone());
     m.castShadow=true;m.material.transparent=true;g.add(m);parts.push(m);
@@ -1254,7 +1256,7 @@ function updateOilTransfers(now){
 
     const stretch=1+.72*Math.sin(Math.min(1,t/Math.max(.001,hold))*Math.PI);
     const shrink=1-smoothstep01((q-.72)/.28)*.72;
-    const base=(e.burst?9.4:7.0)*(1+.10*e.cells.length);
+    const base=(e.burst?6.8:5.2)*(1+.07*e.cells.length);
     for(let j=0;j<e.parts.length;j++){
       const m=e.parts[j],a=j/(e.parts.length-1||1);
       const wob=1+.08*Math.sin(now*14+j*2.1);
@@ -1264,9 +1266,10 @@ function updateOilTransfers(now){
       m.material.opacity=Math.max(0,.98-smoothstep01((q-.78)/.22)*.92);
     }
 
-    if(t>.72){
-      const fade=1-smoothstep01((t-.72)/.28)*.82;
-      for(const c of e.cells)c.targetStrength=Math.min(c.targetStrength,fade);
+    // 油坨一脱离主体，主体体积就同步下降，避免“主体还在 + 又生成一坨”的视觉复制。
+    if(t>.10){
+      const fade=1-smoothstep01((t-.10)/.68);
+      for(const c of e.cells)c.targetStrength=Math.min(c.targetStrength,Math.max(.04,fade));
       oilSurfaceDirty=true;
     }
     if(t>=1){
@@ -1290,28 +1293,10 @@ function inSuctionZone(c){
 function findTarget(){const n=nozzlePos();let best=null,bd=1e9;for(const c of oilCells){if(!inSuctionZone(c))continue;const d=dist(c,n);if(d<bd){bd=d;best=c}}return best}
 function validTarget(c){return inSuctionZone(c)}
 function advectOilTowardNozzle(dt){
-  if(state!=='SUCTION' || !targetCell)return;
-  const n=nozzlePos();
-  const focus={x:targetCell.x,z:targetCell.z};
-  const pulseMul=1+suctionPulseStrength*CFG.oilAdvectionPulseMul;
-  let moved=false;
-  for(const c of oilCells){
-    if(!c.active||c.pendingRemoval)continue;
-    const fd=Math.hypot(c.x-focus.x,c.z-focus.z);
-    if(fd>=CFG.oilAdvectionRadius)continue;
-    const dx=n.x-c.x,dz=n.z-c.z,d=Math.hypot(dx,dz);
-    if(d<=CFG.oilAdvectionStopDistance)continue;
-    const influence=Math.pow(1-fd/CFG.oilAdvectionRadius,1.42);
-    const step=Math.min(
-      CFG.oilAdvectionSpeed*influence*pulseMul*dt,
-      Math.max(0,d-CFG.oilAdvectionStopDistance)
-    );
-    if(step<=0)continue;
-    c.x+=dx/d*step;
-    c.z+=dz/d*step;
-    moved=true;
-  }
-  if(moved)oilSurfaceDirty=true;
+  // 不再修改逻辑 Cell 的 x/z。
+  // 原方案把多个 metaball 核压到一起，会抬高密度，让整片油越吸越大。
+  // 现在“向吸头移动”只做视觉形变；逻辑油量只会减少。
+  if(state==='SUCTION'&&targetCell)oilSurfaceDirty=true;
 }
 
 function clearSuctionPatch(center){
